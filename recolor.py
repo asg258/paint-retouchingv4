@@ -232,7 +232,7 @@ def run_pipeline(
                       slightly less precise edges.
     """
     from preprocess import preprocess_image
-    from segment   import load_model as load_deeplab, get_deeplab_mask
+    from segment_segformer import load_segformer, get_segformer_mask
 
     # Resolve the paint color — exact first, fuzzy fallback.
     color = get_color(color_query)
@@ -241,10 +241,10 @@ def run_pipeline(
         if not suggestions:
             print(f"[recolor] ERROR: '{color_query}' not found and no close matches.")
             sys.exit(1)
-        print(f"[recolor] '{color_query}' not found exactly. Closest match: {suggestions[0]}")
-        print("[recolor] Other suggestions:")
+        safe = suggestions[0].name.encode("ascii","replace").decode()
+        print(f"[recolor] '{color_query}' not found. Closest: {safe}")
         for s in suggestions[1:]:
-            print(f"           {s}")
+            print(f"           {s.code}  {s.name.encode('ascii','replace').decode()}")
         color = suggestions[0]
 
     image_path = Path(image_path)
@@ -255,13 +255,16 @@ def run_pipeline(
     preprocessed = preprocess_image(str(image_path))
     print(f"[stage1] Shape: {preprocessed.shape}")
 
-    # Stage 2: DeepLab coarse mask
-    print("\n--- Stage 2: DeepLab segmentation ---")
-    deeplab, dl_device = load_deeplab()
-    coarse_mask = get_deeplab_mask(preprocessed, model=deeplab, device=dl_device)
-    print(f"[stage2] Mask range: [{coarse_mask.min():.3f}, {coarse_mask.max():.3f}]")
+    # Stage 2: SegFormer ADE20K — semantically correct wall segmentation.
+    # ADE20K class 0 = "wall" (painted drywall), explicitly trained to
+    # distinguish wall from tile, floor, cabinets, and fixtures.
+    # DeepLab COCO background class is completely removed from this pipeline.
+    print("\n--- Stage 2: SegFormer ADE20K wall segmentation ---")
+    sfm_model, sfm_processor, sfm_device = load_segformer()
+    coarse_mask = get_segformer_mask(preprocessed, model=sfm_model,
+                                     processor=sfm_processor, device=sfm_device)
 
-    # Stage 3: SAM boundary refinement (optional)
+    # Stage 3: SAM boundary refinement
     if use_sam:
         print("\n--- Stage 3: SAM boundary refinement ---")
         try:
@@ -273,7 +276,7 @@ def run_pipeline(
             print(f"[stage3] Refined mask range: [{refined_mask.min():.3f}, {refined_mask.max():.3f}]")
         except FileNotFoundError as e:
             print(f"[stage3] WARNING: {e}")
-            print("[stage3] Falling back to coarse DeepLab mask.")
+            print("[stage3] Falling back to SegFormer mask (no SAM checkpoint).")
             refined_mask = coarse_mask
     else:
         print("\n--- Stage 3: Skipped (use_sam=False) ---")

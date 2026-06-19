@@ -84,6 +84,9 @@ class EvalResult:
     change_ratio:        float   # sum_wall / (sum_total + ε)  closer to 1 = better
     ssim_outside:        float   # structural similarity outside wall, closer to 1 = better
     hue_accuracy:        float   # how close recolored wall hue is to target, 0-1
+    mask_entropy:        float   # Shannon entropy of mask values — low = confident, high = uncertain
+    fragmentation_score: float   # 1/(1+log(n_components)) — higher = fewer islands
+    wall_consistency:    float   # 1 - Var_norm(image inside mask) — higher = more uniform surface
 
     # --- normalised [0,1] versions (0=perfect, 1=worst) ---
     edge_error_norm:       float = 0.0
@@ -107,6 +110,9 @@ class EvalResult:
             f"  Brightness err:  {self.brightness_error:.3f}  (norm {self.brightness_error_norm:.3f})\n"
             f"  SSIM outside:    {self.ssim_outside:.4f}  (1.0 = furniture perfectly preserved)\n"
             f"  Hue accuracy:    {self.hue_accuracy:.4f}  (1.0 = exact target hue)\n"
+            f"  Mask entropy:    {self.mask_entropy:.4f}  (low = confident mask)\n"
+            f"  Fragmentation:   {self.fragmentation_score:.4f}  (1.0 = single region)\n"
+            f"  Wall consist.:   {self.wall_consistency:.4f}  (1.0 = uniform surface)\n"
             f"  Wall change:     {self.mean_wall_change:.3f}\n"
             f"  Outside change:  {self.mean_outside_change:.4f}\n"
             f"  Change ratio:    {self.change_ratio:.4f}  (1.0 = all change inside wall)"
@@ -256,7 +262,35 @@ class EvaluationMetrics:
         sum_total = float(diff_mean.sum())
         change_ratio = sum_wall / (sum_total + 1e-6)
 
-        # ── Metric 8: SSIM outside the wall (structural preservation) ──
+        # ── Metric 8a: Mask entropy ────────────────────────────────────
+        # Shannon entropy H = -Σ p·log(p) over the mask value distribution.
+        # A confident mask concentrates values near 0 or 1 → low entropy.
+        # A noisy mask has values spread across [0,1] → high entropy.
+        # We bin the mask into 20 bins and compute discrete entropy.
+        hist, _ = np.histogram(M.ravel(), bins=20, range=(0,1), density=True)
+        hist    = hist / (hist.sum() + 1e-8)
+        mask_entropy = float(-np.sum(hist * np.log(hist + 1e-8)))
+
+        # ── Metric 8b: Fragmentation score ─────────────────────────────
+        # n_components = number of connected regions in M > 0.5.
+        # 1 large connected region → score ≈ 1. Many fragments → score → 0.
+        binary_M = (M > 0.5).astype(np.uint8)
+        n_comp, _ = cv2.connectedComponents(binary_M)
+        n_comp = max(1, n_comp - 1)
+        fragmentation_score = float(1.0 / (1.0 + np.log(n_comp)))
+
+        # ── Metric 8c: Wall consistency ─────────────────────────────────
+        # How uniform is the output image inside the mask?
+        # Low variance → single material (painted wall). High → multiple.
+        # Normalised so 1.0 = completely uniform, 0.0 = maximally varied.
+        if wall_px.sum() > 10:
+            wall_rgb = O[wall_px]
+            raw_var  = float(np.mean(np.var(wall_rgb, axis=0)))
+            wall_consistency = float(1.0 - np.clip(raw_var / 5000.0, 0, 1))
+        else:
+            wall_consistency = 1.0
+
+        # ── Metric 9: SSIM outside the wall (structural preservation) ──
         # WHY: SSIM measures whether the local structure (textures, edges,
         # luminance patterns) of the non-wall region was preserved.
         # Value close to 1.0 = furniture looks identical to original.
@@ -303,6 +337,9 @@ class EvaluationMetrics:
             change_ratio=change_ratio,
             ssim_outside=ssim_outside,
             hue_accuracy=hue_accuracy,
+            mask_entropy=mask_entropy,
+            fragmentation_score=fragmentation_score,
+            wall_consistency=wall_consistency,
             edge_error_norm=e_n,
             color_variance_norm=v_n,
             leakage_norm=l_n,
