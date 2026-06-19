@@ -28,28 +28,19 @@ import matplotlib
 matplotlib.use("Agg")   # save figures without needing a display
 import matplotlib.pyplot as plt
 from pathlib import Path
+from colors import get_color, search_colors, ColorEntry
 
 
 # ---------------------------------------------------------------------------
-# Target paint color
+# Default recoloring parameters
 # ---------------------------------------------------------------------------
-
-# SW 6244 "Knitting Needles" — warm gray/taupe.
-# Source: Sherwin-Williams ColorSnap.
-# NOTE: these values are approximate. To use the exact values, visit:
-#   https://www.sherwin-williams.com and search "SW 6244", then read the hex.
-# Update TARGET_RGB below with the correct values if needed.
-TARGET_COLOR_NAME: str = "SW 6244 Knitting Needles"
-TARGET_RGB: tuple[int, int, int] = (158, 148, 132)   # (R, G, B), approx
 
 # How strongly to apply the new color.
-# 1.0 = full replacement (the wall becomes exactly the target color)
-# 0.8 = 80% new color, 20% original (leaves a little of the original through)
-# Useful range: 0.7–1.0
+# 1.0 = full replacement, 0.0 = no change. Useful range: 0.7–1.0.
 COLOR_BLEND_STRENGTH: float = 0.90
 
-# Pixels with mask value below this are not recolored at all.
-# This protects furniture and objects that crept into the mask.
+# Pixels with mask value below this threshold are not recolored at all.
+# This protects furniture and other objects that crept into the wall mask.
 MASK_THRESHOLD: float = 0.25
 
 
@@ -60,17 +51,17 @@ MASK_THRESHOLD: float = 0.25
 def recolor_walls(
     image_rgb: np.ndarray,
     mask: np.ndarray,
-    target_rgb: tuple[int, int, int] = TARGET_RGB,
+    color: ColorEntry,
     blend_strength: float = COLOR_BLEND_STRENGTH,
     mask_threshold: float = MASK_THRESHOLD,
 ) -> np.ndarray:
     """
-    Repaint wall pixels to the target color while preserving lighting.
+    Repaint wall pixels to the target paint color while preserving lighting.
 
     The approach:
       1. Convert image and target color to LAB.
       2. For every pixel, compute how much to shift A and B toward the target.
-         The shift weight = mask_value × blend_strength.
+         The shift weight = mask_value x blend_strength.
          Pixels deep in the wall get the full shift; edge pixels get a
          proportionally smaller shift, creating a smooth feathered boundary.
       3. L channel is untouched — shadows and highlights are preserved.
@@ -79,20 +70,22 @@ def recolor_walls(
     Args:
         image_rgb:      (H, W, 3) uint8 RGB image (Stage 1 output).
         mask:           (H, W) float32 wall probability mask (Stage 3 output).
-        target_rgb:     (R, G, B) target paint color as uint8 values.
-        blend_strength: How fully to apply the new color (0–1).
+        color:          ColorEntry from the Valspar database (colors.py).
+        blend_strength: How fully to apply the new color (0-1).
         mask_threshold: Mask values below this are left unchanged.
 
     Returns:
         recolored: (H, W, 3) uint8 RGB image with walls repainted.
     """
+    target_rgb = color.rgb
+
     # --- Convert image to LAB ---
     # cv2 expects BGR input for COLOR_BGR2LAB, so convert accordingly.
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     lab_image  = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
     # --- Convert target paint color to LAB ---
-    # Build a 1×1 pixel in the target color, convert it to LAB,
+    # Build a 1x1 pixel in the target color, convert it to LAB,
     # and read off the A and B values we want to push the wall toward.
     target_pixel_bgr = np.array(
         [[[target_rgb[2], target_rgb[1], target_rgb[0]]]], dtype=np.uint8
@@ -101,8 +94,9 @@ def recolor_walls(
     target_a = float(target_lab[0, 0, 1])
     target_b = float(target_lab[0, 0, 2])
 
-    print(f"[recolor] Target: {TARGET_COLOR_NAME}  RGB{target_rgb}")
-    print(f"[recolor] Target LAB — A: {target_a:.1f}  B: {target_b:.1f}")
+    print(f"[recolor] Color: {color.code}  '{color.name}'  RGB{target_rgb}  #{color.hex}")
+    print(f"[recolor] Family: {color.family}  LRV: {color.lrv}")
+    print(f"[recolor] Target LAB - A: {target_a:.1f}  B: {target_b:.1f}")
 
     # --- Build a per-pixel blend weight ---
     # weight = 0 outside the wall (mask below threshold)
@@ -137,14 +131,16 @@ def save_comparison(
     original_rgb: np.ndarray,
     recolored_rgb: np.ndarray,
     mask: np.ndarray,
+    color: ColorEntry,
     save_path: str | Path,
-    color_name: str = TARGET_COLOR_NAME,
 ) -> None:
     """
     Save a 3-panel comparison: original | wall mask | recolored result.
+    Includes a color swatch showing the exact target paint color.
     """
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    fig.suptitle(f"Wall Recoloring — {color_name}", fontsize=14)
+    label = f"{color.code}  {color.name}  #{color.hex}  LRV {color.lrv}"
+    fig.suptitle(f"Wall Recoloring — {label}", fontsize=12)
 
     axes[0].imshow(original_rgb)
     axes[0].set_title("Original")
@@ -154,8 +150,16 @@ def save_comparison(
     axes[1].set_title("Wall mask (refined)")
     axes[1].axis("off")
 
+    # Draw a small color swatch in the corner of the recolored panel
+    # so you can verify the target color at a glance.
+    r, g, b = color.rgb
+    swatch = np.full((40, 120, 3), [r, g, b], dtype=np.uint8)
     axes[2].imshow(recolored_rgb)
-    axes[2].set_title(f"Recolored: {color_name}")
+    axes[2].set_title(f"Recolored: {color.name}")
+    # Embed swatch as inset axes (top-left corner)
+    inset = axes[2].inset_axes([0.01, 0.88, 0.18, 0.10])
+    inset.imshow(swatch)
+    inset.axis("off")
     axes[2].axis("off")
 
     plt.tight_layout()
@@ -170,28 +174,45 @@ def save_comparison(
 
 def run_pipeline(
     image_path: str | Path,
+    color_query: str = "4002-9A",
     use_sam: bool = True,
 ) -> None:
     """
     Run all 4 stages end-to-end and save the recolored image.
 
-    Stage 1 → preprocess
-    Stage 2 → DeepLab mask
-    Stage 3 → SAM refinement (optional, skip with use_sam=False)
-    Stage 4 → LAB recoloring
+    Stage 1 - preprocess
+    Stage 2 - DeepLab mask
+    Stage 3 - SAM refinement (optional, skip with use_sam=False)
+    Stage 4 - LAB recoloring with the chosen Valspar color
 
     Args:
-        image_path: Path to the source room photo.
-        use_sam:    Whether to run SAM refinement.  Set False to skip Stage 3
-                    (faster, slightly less precise edges).
+        image_path:   Path to the source room photo.
+        color_query:  Color name or code from the Valspar database.
+                      e.g. "Lucy Blue", "5001-5C", "#81A9B2"
+                      Fuzzy matching is used if no exact match is found.
+        use_sam:      Whether to run SAM refinement. False = faster but
+                      slightly less precise edges.
     """
     from preprocess import preprocess_image
     from segment   import load_model as load_deeplab, get_deeplab_mask
 
+    # Resolve the paint color — exact first, fuzzy fallback.
+    color = get_color(color_query)
+    if color is None:
+        suggestions = search_colors(color_query, n=3)
+        if not suggestions:
+            print(f"[recolor] ERROR: '{color_query}' not found and no close matches.")
+            sys.exit(1)
+        print(f"[recolor] '{color_query}' not found exactly. Closest match: {suggestions[0]}")
+        print("[recolor] Other suggestions:")
+        for s in suggestions[1:]:
+            print(f"           {s}")
+        color = suggestions[0]
+
     image_path = Path(image_path)
     stem       = image_path.stem
 
-    # ── Stage 1: LAB preprocessing ─────────────────────────────────────────
+    # Stage 1: LAB preprocessing
     print("\n--- Stage 1: LAB preprocessing ---")
     preprocessed = preprocess_image(str(image_path))
     print(f"[stage1] Shape: {preprocessed.shape}")
@@ -220,15 +241,15 @@ def run_pipeline(
         print("\n--- Stage 3: Skipped (use_sam=False) ---")
         refined_mask = coarse_mask
 
-    # Stage 4: Recolor
+    # Stage 4: Recolor using the resolved paint color
     print("\n--- Stage 4: Recoloring ---")
-    recolored = recolor_walls(preprocessed, refined_mask)
+    recolored = recolor_walls(preprocessed, refined_mask, color=color)
 
-    # Save outputs
-    out_recolored   = image_path.parent / f"{stem}_recolored.jpg"
-    out_comparison  = image_path.parent / f"{stem}_comparison.jpg"
+    # Save outputs — name files after the color code so you can compare easily.
+    safe_code  = color.code.replace("/", "-")
+    out_recolored  = image_path.parent / f"{stem}_{safe_code}_recolored.jpg"
+    out_comparison = image_path.parent / f"{stem}_{safe_code}_comparison.jpg"
 
-    # Save the recolored image on its own (full resolution, no borders).
     cv2.imwrite(
         str(out_recolored),
         cv2.cvtColor(recolored, cv2.COLOR_RGB2BGR),
@@ -236,10 +257,10 @@ def run_pipeline(
     )
     print(f"[stage4] Recolored image saved: {out_recolored}")
 
-    # Save the 3-panel comparison figure.
-    save_comparison(preprocessed, recolored, refined_mask, out_comparison)
+    save_comparison(preprocessed, recolored, refined_mask, color, out_comparison)
 
-    print(f"\nDone. Output files:")
+    print(f"\nDone.")
+    print(f"   Color     : {color.code}  {color.name}  #{color.hex}")
     print(f"   Recolored : {out_recolored}")
     print(f"   Comparison: {out_comparison}")
 
@@ -250,12 +271,21 @@ def run_pipeline(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage:   python recolor.py <image_path> [--no-sam]")
-        print("Example: python recolor.py room.jpg")
-        print("         python recolor.py room.jpg --no-sam   # skip SAM, faster")
+        print("Usage:   python recolor.py <image_path> <color name or code> [--no-sam]")
+        print()
+        print("Examples:")
+        print("   python recolor.py room.jpg \"Lucy Blue\"")
+        print("   python recolor.py room.jpg 5001-5C")
+        print("   python recolor.py room.jpg \"warm gray\" --no-sam")
+        print()
+        print("Run  python colors.py  to browse all available colors.")
         sys.exit(1)
 
-    src   = sys.argv[1]
-    no_sam = "--no-sam" in sys.argv
+    src        = sys.argv[1]
+    no_sam     = "--no-sam" in sys.argv
+    # Everything between the image path and any flags is the color query.
+    flag_args  = {"--no-sam"}
+    color_parts = [a for a in sys.argv[2:] if a not in flag_args]
+    color_query = " ".join(color_parts) if color_parts else "4002-9A"
 
-    run_pipeline(src, use_sam=not no_sam)
+    run_pipeline(src, color_query=color_query, use_sam=not no_sam)

@@ -12,8 +12,9 @@ Built with OpenCV, NumPy, PyTorch, and torchvision.
 | 1. Image loading + LAB preprocessing | ✅ Done | `preprocess.py` |
 | 2. DeepLabV3 semantic segmentation | ✅ Done | `segment.py` |
 | 3. SAM boundary refinement | ✅ Done | `refine.py` |
-| 4. Color transfer / recoloring | 🔜 Planned | — |
-| 5. Post-processing + output | 🔜 Planned | — |
+| 4. LAB wall recoloring | ✅ Done | `recolor.py` |
+| 5. Official color database | ✅ Done | `colors.py` + `colors_valspar.csv` |
+| 6. Post-processing + output | 🔜 Planned | — |
 
 ---
 
@@ -277,6 +278,91 @@ python refine.py room.jpg
 # runs all 3 stages end-to-end, opens a 4-panel figure:
 #   original + prompts | coarse mask | refined mask | difference
 # saves <image_stem>_refined_mask.png
+```
+
+---
+
+## Stage 4 — Wall Recoloring (`recolor.py`)
+
+Takes the refined mask from Stage 3 and repaints the wall region to any
+color in the official Valspar database.
+
+### How the recoloring works
+
+We stay in **LAB color space** for the same reason as Stage 1:
+- `L` channel = lightness → we leave this completely untouched
+- `A` and `B` channels = color → we shift these toward the target paint color
+
+For every pixel in the wall mask:
+```
+new_A = original_A × (1 - weight) + target_A × weight
+new_B = original_B × (1 - weight) + target_B × weight
+
+where weight = mask_probability × blend_strength
+```
+
+This means:
+- Pixels deep inside the wall (mask ≈ 1.0) get the full target color
+- Edge pixels (mask ≈ 0.3) get a partial shift — smooth, natural feathering
+- Shadows and highlights are fully preserved — the wall looks lit by the same light
+
+### Run it
+
+```bash
+python recolor.py room.jpg "Lucy Blue"
+python recolor.py room.jpg 5001-5C
+python recolor.py room.jpg "warm gray" --no-sam
+```
+
+Output files are saved next to the source image, named after the color code:
+```
+room_5001-5C_recolored.jpg    ← full resolution result
+room_5001-5C_comparison.jpg   ← 3-panel: original | mask | recolored
+```
+
+---
+
+## Color Database (`colors.py` + `colors_valspar.csv`)
+
+1,596 official Valspar / Sherwin-Williams paint colors with full RGB values,
+loaded from the official Lowe's Digital Data 2025 dataset.
+
+### Look up a color
+
+```python
+from colors import get_color, search_colors, list_colors, list_families
+
+# Exact lookup — by code, name, or hex (any of the three works)
+color = get_color("5001-5C")          # by code
+color = get_color("Lucy Blue")        # by name (case-insensitive)
+color = get_color("#81A9B2")          # by hex
+
+# color.name   → "Lucy Blue"
+# color.code   → "5001-5C"
+# color.rgb    → (129, 169, 178)
+# color.hex    → "81A9B2"
+# color.family → "Blues"
+# color.lrv    → 36.0
+
+# Fuzzy search — great for partial names or unsure spelling
+results = search_colors("dusty teal", n=5)
+
+# Browse all colors in a family
+grays = list_colors("Grays")
+
+# See all available families
+list_families()
+# → ['Blacks', 'Blues', 'Browns', 'Grays', 'Greens',
+#    'Neutrals', 'Oranges', 'Pinks', 'Purples',
+#    'Reds', 'Teals', 'Whites', 'Yellows']
+```
+
+### Browse from the terminal
+
+```bash
+python colors.py                  # shows sample colors from each family
+python colors.py "Lucy Blue"      # exact + fuzzy results for any query
+python colors.py warm beige       # multi-word queries work too
 ```
 
 ---
