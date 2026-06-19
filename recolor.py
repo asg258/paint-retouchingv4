@@ -317,8 +317,9 @@ def run_pipeline(
 
     save_comparison(preprocessed, recolored, final_mask, color, out_comparison)
 
+    safe_name = color.name.encode("ascii", "replace").decode()
     print(f"\nDone.")
-    print(f"   Color     : {color.code}  {color.name}  #{color.hex}")
+    print(f"   Color     : {color.code}  {safe_name}  #{color.hex}")
     print(f"   Recolored : {out_recolored}")
     print(f"   Comparison: {out_comparison}")
 
