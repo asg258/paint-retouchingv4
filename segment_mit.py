@@ -201,15 +201,77 @@ def get_wall_mask(
         output = model({"img_data": tensor}, segSize=(h, w))
         # output shape: (1, 150, H, W) — probabilities (use_softmax=True)
 
-    # Extract ADE20K class 0 = wall.
-    wall_prob = output[0, WALL_CLASS_IDX].cpu().numpy().astype(np.float32)
+    probs_np = output[0].cpu().numpy()           # (150, H, W)
+    wall_prob = probs_np[WALL_CLASS_IDX].copy()  # P(wall) raw
 
-    coverage = float((wall_prob > COVERAGE_THRESHOLD).mean() * 100)
-    print(f"[mit_seg] Wall mask: range=[{wall_prob.min():.3f}, {wall_prob.max():.3f}]  "
-          f"mean={wall_prob.mean():.3f}  "
-          f"coverage={coverage:.1f}% (ADE20K class 0 = wall)")
+    # ------------------------------------------------------------------
+    # Fix 1: Multi-class exclusion using ADE20K's non-wall predictions.
+    #
+    # Diagnostic showed ADE20K correctly labels:
+    #   mirror=27 (5% of pixels), cabinet=10 (20.5%), floor=3 (10.8%)
+    # but incorrectly labels shower tile as wall=0 with P≈0.999.
+    #
+    # For all correctly-labelled non-wall surfaces, use ADE20K's own
+    # confidence as a suppression signal:
+    #   P_corrected = P(wall) × Π (1 − weight × P(non_wall_class))
+    #
+    # Each factor (1 − w × P_class) ≈ 1 when that class is not predicted,
+    # and suppresses wall probability proportionally when it IS predicted.
+    # Mirror (weight=1.2) and countertop (0.9) get the hardest suppression;
+    # door/ceiling get softer suppression since they adjoin walls.
+    # ------------------------------------------------------------------
+    NON_WALL_EXCLUSIONS = {
+        27: 1.2,   # mirror       — directly contradicts wall
+        3:  0.9,   # floor        — clearly not a wall surface
+        28: 0.9,   # rug          — never wall
+        70: 0.9,   # countertop   — never wall
+        10: 0.7,   # cabinet      — moderate (cabinet backs can look like wall)
+        58: 0.8,   # screen/door  — mostly not wall
+        5:  0.4,   # ceiling      — gentle (ceiling-wall junction exists)
+        14: 0.4,   # door         — gentle (door frame adjoins wall)
+    }
 
-    return wall_prob
+    exclusion = np.ones((h, w), dtype=np.float32)
+    for cls_idx, weight in NON_WALL_EXCLUSIONS.items():
+        # (1 - w × P_class) clipped to [0,1] so it cannot amplify
+        exclusion *= np.clip(1.0 - weight * probs_np[cls_idx], 0.0, 1.0)
+
+    P_wall_excl = (wall_prob * exclusion).clip(0.0, 1.0).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Fix 2: Texture-based pre-suppression for shower tile.
+    #
+    # ADE20K outputs P(wall)≈0.999 on bathroom tile — a complete model
+    # failure. Since ADE20K cannot distinguish beige tile from the
+    # original salmon wall, we must use visual analysis.
+    #
+    # compute_periodic_texture_penalty() detects structured, repeating
+    # Laplacian patterns (grout lines) and returns low values for tile.
+    # We apply it as a HARD gate here (before SAM prompts are generated)
+    # so tile pixels NEVER become foreground prompts that tell SAM
+    # "this tile is a wall". Hard threshold at 0.40: regions with
+    # W_tile < 0.40 are zeroed, eliminating tile from the wall prior.
+    # ------------------------------------------------------------------
+    # --- Texture penalty (catches grout-heavy tile patterns) ---
+    from mask_pipeline import compute_periodic_texture_penalty
+    W_tile = compute_periodic_texture_penalty(image)
+    W_tile_gate = np.where(W_tile < 0.40, 0.0, W_tile).astype(np.float32)
+
+    # NOTE: Saturation-based suppression moved to mask_pipeline.py (Stage 3b)
+    # as W_sat signal. Applying it here reduced M0 below the SAM FG threshold,
+    # causing SAM to lose wall anchors and under-color the actual walls.
+    # The texture gate alone acts as a pre-SAM filter; saturation discrimination
+    # happens post-SAM where the mask values are independent of prompt selection.
+
+    wall_prob_final = (P_wall_excl * W_tile_gate).clip(0.0, 1.0).astype(np.float32)
+
+    coverage_raw   = float((wall_prob       > COVERAGE_THRESHOLD).mean() * 100)
+    coverage_final = float((wall_prob_final > COVERAGE_THRESHOLD).mean() * 100)
+    print(f"[mit_seg] Raw P(wall): {wall_prob.mean():.3f}  coverage={coverage_raw:.1f}%")
+    print(f"[mit_seg] Corrected:   {wall_prob_final.mean():.3f}  coverage={coverage_final:.1f}%"
+          f"  (excl+tile suppression applied)")
+
+    return wall_prob_final
 
 
 # ---------------------------------------------------------------------------

@@ -57,9 +57,15 @@ COLOR_BG_POINTS: int = 6
 # 0.6 = good balance — preserves shading variation while reaching target depth
 L_BLEND_STRENGTH: float = 0.60
 
-# For target colors with LRV above this, don't shift L at all (light colors
-# already look fine with the original L channel approach).
+# For target colors with LRV above this, don't shift L at all.
 L_SHIFT_MAX_LRV: float = 40.0
+
+# Maximum allowed L-channel shift per pixel (cv2 LAB scale, 0-255).
+# Without this cap, the Retinex formula O_L = target_L × (I_L / mean_wall_L)
+# overshoots in bright narrow strips (e.g. wall above shower frame) where
+# I_L >> mean_wall_L, producing hyperpigmentation artifacts.
+# 35 LAB units ≈ a perceptible but not jarring brightness difference.
+MAX_L_SHIFT: float = 35.0
 
 # ---------------------------------------------------------------------------
 # Texture analysis parameters
@@ -386,6 +392,12 @@ def luminance_aware_recolor(
         retinex_L = target_L * (I_L / mean_wall_L)
         alpha     = l_blend_strength * M
         O_L       = (1.0 - alpha) * I_L + alpha * retinex_L
+        # Clamp the L shift to ±MAX_L_SHIFT.
+        # Without this, bright strips (I_L >> mean_wall_L, e.g. wall above
+        # a shower frame) produce retinex_L values far outside the wall's
+        # normal range, causing the hyperpigmentation artifacts visible above
+        # the shower enclosure.
+        O_L = np.clip(O_L, I_L - MAX_L_SHIFT, I_L + MAX_L_SHIFT)
     else:
         O_L = I_L.copy()
 

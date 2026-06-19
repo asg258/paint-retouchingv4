@@ -123,6 +123,23 @@ REFLECT_HUE_THRESH: float = 0.20  # normalised hue-std above which reflection
 # similar colors remain near 1, different materials drop faster at large d.
 COLOR_SIGMA_GAUSS: float = 40.0   # Gaussian σ in LAB units (replaces COLOR_SIGMA)
 
+# --- Saturation weight (catches large-format smooth tile post-SAM) ---
+# Measured in this bathroom: tile S≈87-103, painted wall S≈117-184 (HSV 0-255).
+# Sigmoid centred at SAT_CENTER with width SAT_WIDTH gives:
+#   S=93  → W≈0.14  (tile suppressed)
+#   S=117 → W≈0.73  (wall mostly kept, strong-wall floor covers the rest)
+#   S=169 → W≈0.998 (saturated wall fully kept)
+# Only applied when mean wall saturation > SAT_MIN_APPLY (avoids suppressing
+# low-saturation white/grey painted walls that need no correction).
+# Calibrated so tile (S≈87-103) gets suppressed while wall (S≈117-184) passes:
+#   S=87  → 1/(1+exp(-(87-100)/8))  = sigmoid(-1.63) ≈ 0.16  ← tile gone
+#   S=103 → sigmoid( 0.38)          ≈ 0.59  ← tile reduced
+#   S=117 → sigmoid( 2.13)          ≈ 0.89  ← wall kept
+#   S=143 → sigmoid( 5.38)          ≈ 1.00  ← wall kept
+SAT_CENTER:    float = 100.0
+SAT_WIDTH:     float = 8.0
+SAT_MIN_APPLY: float = 90.0    # don't apply if wall is naturally low-sat
+
 # --- Connected-component filtering (Step 4) ---
 # Remove isolated mask regions that are too small to be real wall planes.
 MIN_COMPONENT_PX: int   = 800    # components smaller than this are zeroed
@@ -424,6 +441,72 @@ def compute_reflection_penalty(
 
 
 # ---------------------------------------------------------------------------
+# NEW — Saturation Weight (large-format smooth tile post-SAM)
+# ---------------------------------------------------------------------------
+
+def compute_saturation_weight(
+    image_rgb:   np.ndarray,
+    sam_mask:    np.ndarray,
+    center:      float = SAT_CENTER,
+    width:       float = SAT_WIDTH,
+    min_apply:   float = SAT_MIN_APPLY,
+) -> np.ndarray:
+    """
+    Suppress pixels whose HSV saturation is significantly below the wall's.
+
+    WHY THIS IS NEEDED
+    ------------------
+    Large-format smooth tile produces W_tile≈1.0 (no grout texture detected),
+    and ADE20K gives P(wall)≈0.999 for it (model failure). The periodic texture
+    penalty misses it. But physically, bathroom tile IS less saturated than
+    the original painted wall:
+        Measured: tile S≈87-103, painted wall S≈117-184 (HSV 0-255 scale)
+
+    A sigmoid centred at SAT_CENTER=108 provides:
+        S=93  → W≈0.14  (tile strongly suppressed)
+        S=103 → W≈0.33  (tile suppressed)
+        S=117 → W≈0.73  (wall — strong-wall floor 0.60 covers the remainder)
+        S=169 → W≈0.998 (saturated wall, untouched)
+
+    This is applied POST-SAM (unlike the hard texture gate in segment_mit.py)
+    because applying it pre-SAM reduced M0 below the FG threshold and caused
+    SAM to lose its foreground wall anchors.
+
+    Adaptive reference: the mean saturation of confident SAM wall pixels is
+    computed; if it's below min_apply the filter is disabled (prevents
+    suppressing white/grey walls that are correctly low-saturation).
+
+    Args:
+        image_rgb: (H, W, 3) uint8 RGB.
+        sam_mask:  (H, W) float32 SAM-refined mask (used to estimate wall sat).
+        center:    Sigmoid centre in HSV saturation units.
+        width:     Sigmoid width.
+        min_apply: Minimum mean-wall-saturation to activate the filter.
+
+    Returns:
+        W_sat: (H, W) float32, values ∈ (0, 1].
+    """
+    bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    S   = hsv[:, :, 1]   # saturation channel, 0–255
+
+    # Estimate mean wall saturation from confident SAM pixels (> 0.7).
+    wall_px = sam_mask > 0.70
+    if wall_px.sum() > 200:
+        mean_wall_S = float(np.percentile(S[wall_px], 75))
+    else:
+        mean_wall_S = float(S.mean())
+
+    if mean_wall_S < min_apply:
+        # Wall is naturally low-saturation (white/grey paint) — don't suppress.
+        return np.ones((image_rgb.shape[0], image_rgb.shape[1]), dtype=np.float32)
+
+    # Sigmoid: 1/(1 + exp(-(S - center)/width))
+    W_sat = (1.0 / (1.0 + np.exp(-(S - center) / width))).astype(np.float32)
+    return W_sat
+
+
+# ---------------------------------------------------------------------------
 # NEW — Small Component Filter (Step 4)
 # ---------------------------------------------------------------------------
 
@@ -531,13 +614,16 @@ def material_aware_mask(
     # They are multiplicative because they represent hard physical evidence
     # ("this IS tile", "this IS a mirror") that should override the base weight.
 
-    # Periodic texture penalty — suppresses tile grout patterns.
+    # Periodic texture penalty — suppresses grout-heavy tile (fine texture).
     W_tile    = compute_periodic_texture_penalty(image_rgb)
     # Reflection penalty — suppresses mirror and polished glass.
     W_reflect = compute_reflection_penalty(image_rgb)
+    # Saturation weight — suppresses large-format smooth tile (missed by W_tile).
+    # Applied post-SAM to avoid lowering M0 below the FG threshold pre-SAM.
+    W_sat     = compute_saturation_weight(image_rgb, sam_mask)
 
     # Apply targeted suppressions to the base weight.
-    W_combined = W_material * W_tile * W_reflect
+    W_combined = W_material * W_tile * W_reflect * W_sat
     W_combined = np.clip(W_combined, 0.0, 1.0).astype(np.float32)
 
     # --- Apply to SAM mask ---
@@ -586,6 +672,7 @@ def material_aware_mask(
         "W_gradient":      W_grad,
         "W_tile":          W_tile,
         "W_reflect":       W_reflect,
+        "W_sat":           W_sat,
         "W_material_base": W_material,
         "W_combined":      W_combined,
         "M_sam_raw":       sam_mask,
