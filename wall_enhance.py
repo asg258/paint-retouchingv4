@@ -61,6 +61,33 @@ L_BLEND_STRENGTH: float = 0.60
 # already look fine with the original L channel approach).
 L_SHIFT_MAX_LRV: float = 40.0
 
+# ---------------------------------------------------------------------------
+# Texture analysis parameters
+# ---------------------------------------------------------------------------
+
+# Laplacian blur radius for computing local texture energy.
+# Larger = smoother texture map, less sensitive to noise but may blur
+# the boundary between smooth wall and textured tile.
+TEXTURE_BLUR_SIGMA:  float = 8.0
+TEXTURE_BLUR_KERNEL: int   = 31   # must be odd
+
+# Pixels with normalised texture energy above this are considered
+# textured surfaces (tile, wood grain, fabric) — not painted wall.
+# Range [0,1].  Lower = more aggressive tile exclusion.
+TEXTURE_BG_THRESH: float = 0.20
+
+# Pixels with texture below this are eligible as foreground (wall) prompts.
+# Keeps SAM from sampling ambiguous mid-texture areas as wall anchors.
+TEXTURE_FG_THRESH: float = 0.12
+
+# How many background prompt points to take from high-texture regions.
+TEXTURE_BG_POINTS: int = 12
+
+# Spatial prior: ignore the bottom fraction of the image for FG sampling.
+# Painted walls are rarely on the floor — excluding the bottom portion
+# prevents floor tiles from being sampled as foreground wall points.
+WALL_BOTTOM_EXCLUSION: float = 0.25   # ignore bottom 25% for FG prompts
+
 
 # ---------------------------------------------------------------------------
 # 1. WALL COLOR STATISTICS
@@ -427,3 +454,155 @@ def luminance_protection_mask(
     # Take element-wise max: existing protection OR luminance-based protection.
     boosted = np.maximum(existing_protect.astype(np.float32), dark_smooth)
     return np.clip(boosted, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# 6. TEXTURE-BASED MATERIAL SEPARATION
+# ---------------------------------------------------------------------------
+
+def compute_texture_map(
+    image_rgb:   np.ndarray,
+    blur_sigma:  float = TEXTURE_BLUR_SIGMA,
+    blur_kernel: int   = TEXTURE_BLUR_KERNEL,
+) -> np.ndarray:
+    """
+    Compute a per-pixel texture energy map using the Laplacian operator.
+
+    WHY THIS WORKS FOR SEPARATING WALL FROM TILE/WOOD
+    --------------------------------------------------
+    The Laplacian ∇²I measures the second spatial derivative of intensity:
+        ∇²I(x,y) = ∂²I/∂x² + ∂²I/∂y²
+
+    It produces a large response at edges and fine texture patterns.
+    Painted drywall is spectrally smooth — very low Laplacian magnitude.
+    Tile grout lines, wood grain, and fabric all produce high Laplacian
+    magnitude because they contain repeated high-frequency edge patterns.
+
+    By blurring the absolute Laplacian with a wide Gaussian, we get a
+    smooth map of local texture energy:
+
+        T(x,y) = GaussianBlur(|∇²I(x,y)|, σ)
+
+    Low T → smooth surface → likely painted wall
+    High T → textured surface → likely tile, wood, fabric, or trim
+
+    Args:
+        image_rgb:   (H, W, 3) uint8 RGB.
+        blur_sigma:  Gaussian sigma for local texture energy pooling.
+        blur_kernel: Gaussian kernel size (must be odd).
+
+    Returns:
+        texture_map: (H, W) float32, normalised to [0, 1].
+                     0 = very smooth (likely painted wall)
+                     1 = highly textured (likely tile / wood)
+    """
+    # Work on luminance (grayscale) to avoid color variation contaminating
+    # the texture signal — a yellow wall and beige tile can look similar in
+    # color but differ sharply in texture.
+    bgr  = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # Laplacian: second derivative → high at edges and fine detail.
+    lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+
+    # Absolute value: we care about magnitude, not sign.
+    lap_abs = np.abs(lap)
+
+    # Pool locally with a wide Gaussian so individual edge pixels don't
+    # dominate — we want the average texture density in a neighbourhood.
+    k = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
+    texture_energy = cv2.GaussianBlur(lap_abs, (k, k), blur_sigma)
+
+    # Normalise to [0, 1].  Use 99th percentile to avoid outliers
+    # (e.g. a very bright specular highlight) compressing the range.
+    p99 = float(np.percentile(texture_energy, 99))
+    if p99 < 1e-6:
+        return np.zeros_like(texture_energy)
+    texture_map = np.clip(texture_energy / p99, 0.0, 1.0).astype(np.float32)
+
+    return texture_map
+
+
+def texture_based_background_points(
+    image_rgb:    np.ndarray,
+    texture_map:  np.ndarray,
+    n_points:     int   = TEXTURE_BG_POINTS,
+    n_zones:      int   = 4,
+    bg_threshold: float = TEXTURE_BG_THRESH,
+) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """
+    Sample background SAM prompt points from high-texture image regions.
+
+    High-texture pixels (tile grout lines, wood grain) are almost certainly
+    NOT painted wall. Providing them as SAM background anchors gives SAM
+    the discriminative signal it needs to exclude those surfaces from the
+    wall mask — even when the DeepLab background class covers everything.
+
+    Args:
+        image_rgb:    (H, W, 3) uint8 RGB (used for zone dimensions).
+        texture_map:  (H, W) float32 from compute_texture_map().
+        n_points:     Target number of background prompt points.
+        n_zones:      Spatial grid divisions per axis.
+        bg_threshold: Texture value above which a pixel is a BG candidate.
+
+    Returns:
+        (coords, labels) or (None, None) if no candidates found.
+    """
+    h, w = image_rgb.shape[:2]
+    rng  = np.random.default_rng(seed=77)
+    pts_per_zone = max(1, n_points // (n_zones * n_zones))
+    zone_h = max(1, h // n_zones)
+    zone_w = max(1, w // n_zones)
+
+    bg_list: list[tuple[int, int]] = []
+    for zi in range(n_zones):
+        for zj in range(n_zones):
+            y0, y1 = zi * zone_h, min(h, (zi + 1) * zone_h)
+            x0, x1 = zj * zone_w, min(w, (zj + 1) * zone_w)
+            zone_t  = texture_map[y0:y1, x0:x1]
+            ty, tx  = np.where(zone_t >= bg_threshold)
+            if len(ty) > 0:
+                k = min(pts_per_zone, len(ty))
+                idx = rng.choice(len(ty), k, replace=False)
+                for i in idx:
+                    bg_list.append((int(x0 + tx[i]), int(y0 + ty[i])))
+
+    if not bg_list:
+        return None, None
+    bg_arr    = np.array(bg_list, dtype=np.float32)
+    bg_labels = np.zeros(len(bg_arr), dtype=int)
+    return bg_arr, bg_labels
+
+
+def texture_suppressed_mask(
+    mask:        np.ndarray,
+    texture_map: np.ndarray,
+    suppress_threshold: float = TEXTURE_BG_THRESH,
+    suppress_strength:  float = 0.85,
+) -> np.ndarray:
+    """
+    Suppress mask values in high-texture regions after SAM refinement.
+
+    Even after SAM, the soft mask (M_refined = SAM_binary × M₀) retains
+    high values in tile areas because M₀ was high everywhere (DeepLab
+    background class). Multiplying by a texture suppression factor reduces
+    the mask weight in textured regions so the blending formula
+    O = M*R + (1-M)*I gives tile its original color back.
+
+    Formula:
+        suppress_weight(x,y) = 1 - suppress_strength × clip(T(x,y)/1, 0, 1)
+        M_out(x,y) = M(x,y) × suppress_weight(x,y)
+
+    Args:
+        mask:               (H, W) float32 wall mask.
+        texture_map:        (H, W) float32 from compute_texture_map().
+        suppress_threshold: Texture above this starts suppressing the mask.
+        suppress_strength:  Maximum suppression factor (0=no effect, 1=full).
+
+    Returns:
+        M_suppressed: (H, W) float32, values in [0, 1].
+    """
+    # How much to suppress, scaled by how far above threshold the texture is.
+    excess   = np.clip((texture_map - suppress_threshold) / (1.0 - suppress_threshold + 1e-6), 0.0, 1.0)
+    suppress = 1.0 - suppress_strength * excess
+    return np.clip(mask.astype(np.float32) * suppress, 0.0, 1.0)

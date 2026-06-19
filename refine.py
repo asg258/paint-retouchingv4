@@ -169,6 +169,7 @@ def generate_sam_prompts(
     n_zones:       int   = N_ZONES,
     image:         np.ndarray | None = None,
     wall_stats:    dict  | None = None,
+    texture_map:   np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Sample spatially-spread foreground and background prompts from the mask.
@@ -211,39 +212,54 @@ def generate_sam_prompts(
     Raises:
         ValueError: if no foreground prompts can be found.
     """
+    from wall_enhance import TEXTURE_BG_THRESH, TEXTURE_FG_THRESH, WALL_BOTTOM_EXCLUSION
     h, w = coarse_mask.shape
-    rng = np.random.default_rng(seed=42)   # fixed seed for reproducibility
+    rng = np.random.default_rng(seed=42)
 
-    # How many points each zone contributes from its local budget.
-    # Integer division — any remainder is silently dropped (acceptable rounding).
-    n_cells = n_zones * n_zones
+    # Spatial prior: walls are never on the floor.
+    # Exclude the bottom WALL_BOTTOM_EXCLUSION fraction from FG sampling.
+    fg_y_max = int(h * (1.0 - WALL_BOTTOM_EXCLUSION))
+
+    n_cells     = n_zones * n_zones
     fg_per_zone = max(1, max_fg_points // n_cells)
     bg_per_zone = max(1, max_bg_points // n_cells)
-
     zone_h = max(1, h // n_zones)
     zone_w = max(1, w // n_zones)
 
-    fg_list: list[tuple[int, int]] = []   # (x, y) pairs
+    fg_list: list[tuple[int, int]] = []
     bg_list: list[tuple[int, int]] = []
 
     for zi in range(n_zones):
         for zj in range(n_zones):
-            # Pixel bounds for this zone — clamp to image edges.
             y0, y1 = zi * zone_h, min(h, (zi + 1) * zone_h)
             x0, x1 = zj * zone_w, min(w, (zj + 1) * zone_w)
 
-            zone = coarse_mask[y0:y1, x0:x1]
+            zone_mask = coarse_mask[y0:y1, x0:x1]
 
-            # --- Foreground pixels in this zone (high-confidence wall) ---
-            fy, fx = np.where(zone >= fg_threshold)
+            # --- Foreground: high-confidence wall AND smooth (low-texture) ---
+            # Texture filtering is the key fix: it prevents tile and wood-grain
+            # pixels from becoming foreground prompts even when DeepLab scored
+            # them as background (which it does for everything in bathrooms).
+            if texture_map is not None:
+                zone_tex  = texture_map[y0:y1, x0:x1]
+                # Only consider pixels that are both high mask AND low texture.
+                fg_valid  = (zone_mask >= fg_threshold) & (zone_tex < TEXTURE_FG_THRESH)
+                # Also enforce the spatial prior: no FG from bottom of image.
+                if y1 > fg_y_max:
+                    row_limit = max(0, fg_y_max - y0)
+                    fg_valid[row_limit:, :] = False
+            else:
+                fg_valid = zone_mask >= fg_threshold
+
+            fy, fx = np.where(fg_valid)
             if len(fy) > 0:
                 k = min(fg_per_zone, len(fy))
                 chosen = rng.choice(len(fy), k, replace=False)
                 for idx in chosen:
                     fg_list.append((int(x0 + fx[idx]), int(y0 + fy[idx])))
 
-            # --- Background pixels in this zone (high-confidence non-wall) ---
-            by, bx = np.where(zone <= bg_threshold)
+            # --- Background: mask-low pixels in this zone ---
+            by, bx = np.where(zone_mask <= bg_threshold)
             if len(by) > 0:
                 k = min(bg_per_zone, len(by))
                 chosen = rng.choice(len(by), k, replace=False)
@@ -251,29 +267,53 @@ def generate_sam_prompts(
                     bg_list.append((int(x0 + bx[idx]), int(y0 + by[idx])))
 
     if not fg_list:
-        raise ValueError(
-            f"No foreground prompts found (no pixels with mask > {fg_threshold} "
-            f"in any of the {n_zones}x{n_zones} zones). "
-            "Try lowering FG_THRESHOLD."
-        )
+        # Texture filtering may have removed all FG candidates.
+        # Fall back: relax texture constraint and sample from mask-only.
+        print("[refine] No FG pts after texture filter — relaxing to mask-only FG.")
+        for zi in range(n_zones):
+            for zj in range(n_zones):
+                y0, y1 = zi * zone_h, min(h, (zi + 1) * zone_h)
+                x0, x1 = zj * zone_w, min(w, (zj + 1) * zone_w)
+                zone_mask = coarse_mask[y0:y1, x0:x1]
+                fy, fx = np.where(zone_mask >= fg_threshold)
+                if len(fy) > 0:
+                    k = min(fg_per_zone, len(fy))
+                    chosen = rng.choice(len(fy), k, replace=False)
+                    for idx in chosen:
+                        fg_list.append((int(x0 + fx[idx]), int(y0 + fy[idx])))
+        if not fg_list:
+            raise ValueError(
+                f"No foreground prompts found (mask > {fg_threshold} in any zone). "
+                "Try lowering FG_THRESHOLD."
+            )
 
     fg_arr    = np.array(fg_list, dtype=np.float32)      # (n_fg, 2)
     fg_labels = np.ones(len(fg_arr), dtype=int)
 
     if not bg_list and image is not None:
-        # Mask-based approach found no background points.
-        # This happens when DeepLab assigns high background probability to
-        # everything (bathrooms, kitchens) — nothing scores below bg_threshold.
-        # Fall back to image color analysis: dark pixels, desaturated pixels,
-        # and hue-deviant pixels are reliable non-wall indicators.
-        from wall_enhance import color_based_background_points
-        cb_coords, cb_labels = color_based_background_points(
-            image, coarse_mask, wall_stats=wall_stats, n_points=max_bg_points,
-        )
-        if cb_coords is not None:
-            bg_list = [tuple(int(v) for v in p) for p in cb_coords]
-            print("[refine] Zero mask-based BG — using color-analysis fallback "
-                  f"({len(bg_list)} points from dark/desat/hue-deviant pixels).")
+        # Mask-based BG failed (DeepLab scored everything as wall/background).
+        # Try two fallbacks in priority order:
+        #   1. Texture-based: high-texture pixels (tile, wood) → not wall
+        #   2. Color-based: dark/desat/hue-deviant pixels → not wall
+        if texture_map is not None:
+            from wall_enhance import texture_based_background_points
+            tb_coords, tb_labels = texture_based_background_points(
+                image, texture_map, n_points=max_bg_points * 2
+            )
+            if tb_coords is not None:
+                bg_list = [tuple(int(v) for v in p) for p in tb_coords]
+                print(f"[refine] Zero mask-based BG — texture fallback: "
+                      f"{len(bg_list)} pts from high-texture (tile/wood) pixels.")
+
+        if not bg_list and image is not None:
+            from wall_enhance import color_based_background_points
+            cb_coords, cb_labels = color_based_background_points(
+                image, coarse_mask, wall_stats=wall_stats, n_points=max_bg_points,
+            )
+            if cb_coords is not None:
+                bg_list = [tuple(int(v) for v in p) for p in cb_coords]
+                print("[refine] Color-analysis BG fallback: "
+                      f"{len(bg_list)} pts from dark/desat/hue-deviant pixels.")
 
     if bg_list:
         bg_arr    = np.array(bg_list, dtype=np.float32)
@@ -420,18 +460,23 @@ def refine_mask_with_sam(
     # predictor in — it caches the embedding automatically.
     predictor.set_image(image)   # expects uint8 RGB
 
-    # Stage 2.5 (color-based mask refinement) REMOVED.
-    # It was compounding suppression with erosion and protection, causing
-    # severe mask fragmentation. SAM is fed the raw DeepLab mask directly.
+    # Compute texture map once — used both for prompt generation and
+    # for post-SAM suppression of tile/wood regions.
+    from wall_enhance import (
+        compute_texture_map,
+        texture_based_background_points,
+        texture_suppressed_mask,
+    )
+    texture_map = compute_texture_map(image)
 
-    # Generate prompts from the unmodified coarse mask.
-    # image is still passed for the color-based BG fallback when
-    # the mask yields zero background points (e.g. bathrooms).
+    # Generate prompts with texture awareness:
+    #   - FG candidates filtered to smooth (low-texture) pixels only
+    #   - BG candidates augmented with high-texture (tile/wood) pixels
     point_coords, point_labels = generate_sam_prompts(
-        coarse_mask, image=image
+        coarse_mask, image=image, texture_map=texture_map
     )
 
-    # Run SAM — returns 3 candidate masks, their quality scores, and logits.
+    # Run SAM — returns 3 candidate masks, quality scores, and logits.
     sam_masks, sam_scores, _ = predictor.predict(
         point_coords=point_coords,
         point_labels=point_labels,
@@ -444,14 +489,19 @@ def refine_mask_with_sam(
     # Blend SAM's crisp binary boundary with DeepLab's soft probabilities.
     refined_mask = _combine_masks(best_mask, coarse_mask)
 
-    # Small dilation to close holes and restore continuity in large wall planes
-    # that SAM may have fragmented into islands.  2px is subtle — just enough
-    # to reconnect regions separated by thin gaps, not enough to leak onto objects.
+    # Post-SAM texture suppression:
+    # Even after SAM, M_refined is high in tile regions because M₀ was high
+    # everywhere (DeepLab background = everything).  Suppressing textured
+    # pixels here reduces tile coloring without touching smooth wall planes.
+    refined_mask = texture_suppressed_mask(refined_mask, texture_map)
+
+    # Small dilation to restore continuity in smooth wall planes that SAM
+    # may have fragmented.  2px only — reconnects gaps without leaking onto objects.
     continuity_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     refined_mask = cv2.dilate(refined_mask, continuity_kernel, iterations=1)
     refined_mask = np.clip(refined_mask, 0.0, 1.0).astype(np.float32)
 
-    return refined_mask   # float32, (H, W), values in [0, 1]
+    return refined_mask
 
 
 # ---------------------------------------------------------------------------
