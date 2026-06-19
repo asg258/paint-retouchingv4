@@ -162,12 +162,14 @@ def load_sam_model(
 # ---------------------------------------------------------------------------
 
 def generate_sam_prompts(
-    coarse_mask: np.ndarray,
-    fg_threshold: float = FG_THRESHOLD,
-    bg_threshold: float = BG_THRESHOLD,
-    max_fg_points: int = MAX_FG_POINTS,
-    max_bg_points: int = MAX_BG_POINTS,
-    n_zones: int = N_ZONES,
+    coarse_mask:   np.ndarray,
+    fg_threshold:  float = FG_THRESHOLD,
+    bg_threshold:  float = BG_THRESHOLD,
+    max_fg_points: int   = MAX_FG_POINTS,
+    max_bg_points: int   = MAX_BG_POINTS,
+    n_zones:       int   = N_ZONES,
+    image:         np.ndarray | None = None,
+    wall_stats:    dict  | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Sample spatially-spread foreground and background prompts from the mask.
@@ -259,8 +261,23 @@ def generate_sam_prompts(
     fg_arr    = np.array(fg_list, dtype=np.float32)      # (n_fg, 2)
     fg_labels = np.ones(len(fg_arr), dtype=int)
 
+    if not bg_list and image is not None:
+        # Mask-based approach found no background points.
+        # This happens when DeepLab assigns high background probability to
+        # everything (bathrooms, kitchens) — nothing scores below bg_threshold.
+        # Fall back to image color analysis: dark pixels, desaturated pixels,
+        # and hue-deviant pixels are reliable non-wall indicators.
+        from wall_enhance import color_based_background_points
+        cb_coords, cb_labels = color_based_background_points(
+            image, coarse_mask, wall_stats=wall_stats, n_points=max_bg_points,
+        )
+        if cb_coords is not None:
+            bg_list = [tuple(int(v) for v in p) for p in cb_coords]
+            print("[refine] Zero mask-based BG — using color-analysis fallback "
+                  f"({len(bg_list)} points from dark/desat/hue-deviant pixels).")
+
     if bg_list:
-        bg_arr    = np.array(bg_list, dtype=np.float32)  # (n_bg, 2)
+        bg_arr    = np.array(bg_list, dtype=np.float32)
         bg_labels = np.zeros(len(bg_arr), dtype=int)
         point_coords = np.concatenate([fg_arr, bg_arr], axis=0)
         point_labels = np.concatenate([fg_labels, bg_labels], axis=0)
@@ -404,8 +421,19 @@ def refine_mask_with_sam(
     # predictor in — it caches the embedding automatically.
     predictor.set_image(image)   # expects uint8 RGB
 
-    # Derive prompt points from the coarse mask.
-    point_coords, point_labels = generate_sam_prompts(coarse_mask)
+    # First, color-refine the coarse mask so SAM sees a cleaner starting point.
+    from wall_enhance import (
+        compute_wall_color_stats,
+        refine_mask_by_color,
+        color_based_background_points,
+    )
+    wall_stats    = compute_wall_color_stats(image, coarse_mask)
+    refined_input = refine_mask_by_color(image, coarse_mask, wall_stats)
+
+    # Derive prompt points; pass image for color-based BG fallback.
+    point_coords, point_labels = generate_sam_prompts(
+        refined_input, image=image, wall_stats=wall_stats
+    )
 
     # Run SAM — returns 3 candidate masks, their quality scores, and the
     # logits (we ignore logits here; they're useful for chained predictions).

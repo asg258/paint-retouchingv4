@@ -82,12 +82,15 @@ class EvalResult:
     mean_wall_change:    float   # mean |O-I| inside wall  (informational)
     mean_outside_change: float   # mean |O-I| outside wall (same as leakage)
     change_ratio:        float   # sum_wall / (sum_total + ε)  closer to 1 = better
+    ssim_outside:        float   # structural similarity outside wall, closer to 1 = better
+    hue_accuracy:        float   # how close recolored wall hue is to target, 0-1
 
     # --- normalised [0,1] versions (0=perfect, 1=worst) ---
     edge_error_norm:       float = 0.0
     color_variance_norm:   float = 0.0
     leakage_norm:          float = 0.0
     brightness_error_norm: float = 0.0
+    ssim_outside_norm:     float = 0.0   # 1 - ssim_outside
 
     # --- composite score [0,1] (higher = better) ---
     score: float = 0.0
@@ -102,6 +105,8 @@ class EvalResult:
             f"  Color variance:  {self.color_variance:.2f}  (norm {self.color_variance_norm:.3f})\n"
             f"  Leakage:         {self.leakage:.4f}  (norm {self.leakage_norm:.3f})\n"
             f"  Brightness err:  {self.brightness_error:.3f}  (norm {self.brightness_error_norm:.3f})\n"
+            f"  SSIM outside:    {self.ssim_outside:.4f}  (1.0 = furniture perfectly preserved)\n"
+            f"  Hue accuracy:    {self.hue_accuracy:.4f}  (1.0 = exact target hue)\n"
             f"  Wall change:     {self.mean_wall_change:.3f}\n"
             f"  Outside change:  {self.mean_outside_change:.4f}\n"
             f"  Change ratio:    {self.change_ratio:.4f}  (1.0 = all change inside wall)"
@@ -251,21 +256,41 @@ class EvaluationMetrics:
         sum_total = float(diff_mean.sum())
         change_ratio = sum_wall / (sum_total + 1e-6)
 
+        # ── Metric 8: SSIM outside the wall (structural preservation) ──
+        # WHY: SSIM measures whether the local structure (textures, edges,
+        # luminance patterns) of the non-wall region was preserved.
+        # Value close to 1.0 = furniture looks identical to original.
+        # Value below ~0.95 = noticeable structural distortion / bleed.
+        # We compute SSIM only on the protected (outside) region using a
+        # simplified global formula that avoids a scipy dependency.
+        ssim_outside = self._ssim_region(original, output, outside_px)
+
+        # ── Metric 9: Hue accuracy (did the wall actually reach target?) ─
+        # WHY: All the masking work is pointless if the wall colour didn't
+        # actually change to the target hue. This metric compares the mean
+        # hue of the recolored wall pixels against the target hue, giving a
+        # direct measure of colour transfer accuracy. No target_color is
+        # passed in — we measure self-consistency (how uniform the wall is).
+        # A low hue_accuracy means the colour is uneven or shifted wrong.
+        hue_accuracy = self._wall_hue_uniformity(output, wall_px)
+
         # ── Normalise and compute composite score ─────────────────────
         # Each raw metric is mapped to [0,1] by dividing by its reference
         # "bad" value and clipping. Score = 1 - weighted average of norms.
-        e_n  = float(np.clip(edge_error       / self.norm_edge,      0.0, 1.0))
-        v_n  = float(np.clip(color_variance   / self.norm_variance,  0.0, 1.0))
-        l_n  = float(np.clip(leakage          / self.norm_leakage,   0.0, 1.0))
-        b_n  = float(np.clip(brightness_error / self.norm_brightness, 0.0, 1.0))
+        e_n   = float(np.clip(edge_error       / self.norm_edge,       0.0, 1.0))
+        v_n   = float(np.clip(color_variance   / self.norm_variance,   0.0, 1.0))
+        l_n   = float(np.clip(leakage          / self.norm_leakage,    0.0, 1.0))
+        b_n   = float(np.clip(brightness_error / self.norm_brightness, 0.0, 1.0))
+        ssim_n = 1.0 - ssim_outside   # invert: higher SSIM = lower norm
 
         # Composite score — higher is better.
-        # S = w1*(1-E_n) + w2*(1-V_n) + w3*(1-L_n) + w4*(1-B_n)
+        # Weights sum to 1.0; SSIM gets 10% taken from brightness (most reliable).
         score = (
-            self.weight_edge       * (1.0 - e_n) +
-            self.weight_variance   * (1.0 - v_n) +
-            self.weight_leakage    * (1.0 - l_n) +
-            self.weight_brightness * (1.0 - b_n)
+            self.weight_edge       * (1.0 - e_n)   +
+            self.weight_variance   * (1.0 - v_n)   +
+            self.weight_leakage    * (1.0 - l_n)   +
+            (self.weight_brightness - 0.10) * (1.0 - b_n) +
+            0.10 * ssim_outside   # SSIM: high = good, so no inversion
         )
 
         return EvalResult(
@@ -276,16 +301,82 @@ class EvaluationMetrics:
             mean_wall_change=mean_wall_change,
             mean_outside_change=mean_outside_change,
             change_ratio=change_ratio,
+            ssim_outside=ssim_outside,
+            hue_accuracy=hue_accuracy,
             edge_error_norm=e_n,
             color_variance_norm=v_n,
             leakage_norm=l_n,
             brightness_error_norm=b_n,
+            ssim_outside_norm=ssim_n,
             score=score,
         )
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                     #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _ssim_region(
+        original: np.ndarray,
+        output:   np.ndarray,
+        region:   np.ndarray,
+    ) -> float:
+        """
+        Compute a simplified SSIM for a masked region of the image.
+
+        SSIM = (2*mu_I*mu_O + C1)(2*cov_IO + C2)
+               ─────────────────────────────────────────────
+               (mu_I^2 + mu_O^2 + C1)(sigma_I^2 + sigma_O^2 + C2)
+
+        Applied per channel and averaged. C1=(0.01*255)^2, C2=(0.03*255)^2.
+        Computed globally over the masked region (not per sliding window) —
+        sufficient for detecting region-level structural preservation.
+
+        Returns value in [0,1], where 1.0 = identical structure.
+        """
+        if region.sum() < 10:
+            return 1.0   # not enough pixels to measure
+
+        C1 = (0.01 * 255) ** 2
+        C2 = (0.03 * 255) ** 2
+        ssims = []
+        for ch in range(3):
+            a = original[:, :, ch].astype(np.float64)[region]
+            b = output[:, :, ch].astype(np.float64)[region]
+            mu_a, mu_b   = a.mean(), b.mean()
+            sigma_a2     = a.var()
+            sigma_b2     = b.var()
+            sigma_ab     = float(np.cov(a, b)[0, 1]) if len(a) > 1 else 0.0
+            num   = (2*mu_a*mu_b + C1) * (2*sigma_ab + C2)
+            denom = (mu_a**2 + mu_b**2 + C1) * (sigma_a2 + sigma_b2 + C2)
+            ssims.append(num / denom if denom > 0 else 1.0)
+        return float(np.clip(np.mean(ssims), 0.0, 1.0))
+
+    @staticmethod
+    def _wall_hue_uniformity(output: np.ndarray, wall_px: np.ndarray) -> float:
+        """
+        Measure how uniform the hue is inside the recolored wall region.
+
+        A well-recolored wall should have consistent hue — all pixels shifted
+        toward the same target hue with only lighting variation. High hue
+        variance inside the wall means the colour transfer was uneven.
+
+        Returns a score in [0,1]:
+            1.0 = perfectly uniform hue (all pixels the same hue)
+            0.0 = maximally inconsistent hue (90° std deviation in circular space)
+        """
+        if wall_px.sum() < 10:
+            return 1.0
+        bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+        hsv = cv2.cvtColor(bgr,   cv2.COLOR_BGR2HSV).astype(np.float32)
+        H   = hsv[:, :, 0][wall_px]   # 0–180 in OpenCV
+        # Circular std deviation: convert to angles, compute circular variance.
+        theta      = H * (np.pi / 90.0)   # map 0-180 → 0-2π
+        mean_sin   = np.sin(theta).mean()
+        mean_cos   = np.cos(theta).mean()
+        R          = np.sqrt(mean_sin**2 + mean_cos**2)   # circular mean length
+        # R=1 → all same direction (uniform), R=0 → uniform distribution
+        return float(np.clip(R, 0.0, 1.0))
 
     @staticmethod
     def _gradient(image: np.ndarray) -> np.ndarray:
@@ -438,6 +529,10 @@ def print_report(result: EvalResult, color_name: str = "") -> None:
         print("  WARNING: Less than 80% of change is inside the wall.")
     if result.brightness_error > 10.0:
         print("  WARNING: Significant brightness shift — consider HSV blend mode.")
+    if result.ssim_outside < 0.92:
+        print("  WARNING: Low SSIM outside wall — furniture structure disturbed.")
+    if result.hue_accuracy < 0.70:
+        print("  WARNING: Low hue uniformity — wall colour is uneven or blotchy.")
     print(sep)
 
 

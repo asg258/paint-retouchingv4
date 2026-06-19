@@ -289,16 +289,24 @@ def run_pipeline(
     # Stage 5: Object protection mask — build a safety buffer around objects
     # so color cannot bleed onto furniture, appliances, or decor.
     print("\n--- Stage 5: Object protection mask ---")
-    from protect import create_object_protection_mask, apply_protection
-    protection_mask = create_object_protection_mask(clean_mask)
-    final_mask      = apply_protection(clean_mask, protection_mask)
-    print(f"[stage5] Protection covers {protection_mask.mean()*100:.1f}% of image")
+    from protect      import create_object_protection_mask, apply_protection
+    from wall_enhance import luminance_protection_mask
+    protection_mask  = create_object_protection_mask(clean_mask)
+    # Boost: explicitly protect dark pixels (furniture/cabinets) regardless of mask.
+    protection_mask  = luminance_protection_mask(preprocessed, protection_mask)
+    final_mask       = apply_protection(clean_mask, protection_mask)
+    print(f"[stage5] Protection (with luma boost) covers {protection_mask.mean()*100:.1f}% of image")
     print(f"[stage5] Final mask range: [{final_mask.min():.3f}, {final_mask.max():.3f}]  "
           f"mean={final_mask.mean():.3f}")
 
-    # Stage 4: Recolor using the resolved paint color
-    print("\n--- Stage 4: Recoloring ---")
-    recolored = recolor_walls(preprocessed, final_mask, color=color)
+    # Stage 4: Retinex-aware recoloring — preserves shading, handles dark LRV correctly.
+    print("\n--- Stage 4: Recoloring (Retinex luminance transfer) ---")
+    from wall_enhance import luminance_aware_recolor, compute_wall_color_stats
+    wall_stats = compute_wall_color_stats(preprocessed, final_mask)
+    recolored  = luminance_aware_recolor(
+        preprocessed, final_mask, color.rgb,
+        wall_stats=wall_stats, target_lrv=color.lrv,
+    )
 
     # Save outputs — name files after the color code so you can compare easily.
     safe_code  = color.code.replace("/", "-")
