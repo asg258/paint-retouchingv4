@@ -279,9 +279,16 @@ def run_pipeline(
         print("\n--- Stage 3: Skipped (use_sam=False) ---")
         refined_mask = coarse_mask
 
+    # Stage 3b: Mask processing — clean + soften before blending
+    print("\n--- Stage 3b: Mask processing ---")
+    from mask_process import process_mask
+    clean_mask = process_mask(refined_mask)
+    print(f"[stage3b] Clean mask range: [{clean_mask.min():.3f}, {clean_mask.max():.3f}]  "
+          f"mean={clean_mask.mean():.3f}")
+
     # Stage 4: Recolor using the resolved paint color
     print("\n--- Stage 4: Recoloring ---")
-    recolored = recolor_walls(preprocessed, refined_mask, color=color)
+    recolored = recolor_walls(preprocessed, clean_mask, color=color)
 
     # Save outputs — name files after the color code so you can compare easily.
     safe_code  = color.code.replace("/", "-")
@@ -295,7 +302,7 @@ def run_pipeline(
     )
     print(f"[stage4] Recolored image saved: {out_recolored}")
 
-    save_comparison(preprocessed, recolored, refined_mask, color, out_comparison)
+    save_comparison(preprocessed, recolored, clean_mask, color, out_comparison)
 
     print(f"\nDone.")
     print(f"   Color     : {color.code}  {color.name}  #{color.hex}")

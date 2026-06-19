@@ -12,6 +12,7 @@ Built with OpenCV, NumPy, PyTorch, and torchvision.
 | 1. Image loading + LAB preprocessing | ✅ Done | `preprocess.py` |
 | 2. DeepLabV3 semantic segmentation | ✅ Done | `segment.py` |
 | 3. SAM boundary refinement | ✅ Done | `refine.py` |
+| 3b. Mask processing (smooth + erode) | ✅ Done | `mask_process.py` |
 | 4. LAB wall recoloring | ✅ Done | `recolor.py` |
 | 5. Official color database | ✅ Done | `colors.py` + `colors_valspar.csv` |
 | 6. Post-processing + output | 🔜 Planned | — |
@@ -278,6 +279,82 @@ python refine.py room.jpg
 # runs all 3 stages end-to-end, opens a 4-panel figure:
 #   original + prompts | coarse mask | refined mask | difference
 # saves <image_stem>_refined_mask.png
+```
+
+---
+
+## Stage 3b — Mask Processing (`mask_process.py`)
+
+Sits between SAM refinement and recoloring. Takes the near-binary SAM mask
+and turns it into a clean, soft probability map that blends naturally.
+
+### Why the SAM mask still needs work
+
+SAM produces excellent boundaries but the mask has four remaining problems:
+
+| Problem | Cause | Effect if unaddressed |
+|---|---|---|
+| Hard 0/1 edges | SAM is a boundary detector, not a blender | Visible seam in the recolored image |
+| Boundary pixel contamination | Edge pixels are shared between wall and adjacent objects | Color bleeds onto sofa/curtain edge |
+| Salt-and-pepper noise | Small isolated regions from DeepLab errors | Random colored pixels in non-wall areas |
+| Jagged contours | SAM traces real texture (curtains, upholstery) | Ragged color boundary |
+
+### What the processing does
+
+```
+SAM binary mask  (0 or 1, hard edges, noise)
+        |
+        v
+  1. Erosion  (cv2.erode, ellipse kernel, 5 px)
+     — shrinks mask inward: contested boundary pixels are excluded
+     — prevents color from reaching pixels shared with adjacent objects
+        |
+        v
+  2. Gaussian blur  (cv2.GaussianBlur, sigma=3, kernel=21)
+     — turns hard 0/1 step into a smooth 0 -> 1 gradient
+     — formula: M_soft[x,y] = sum G(dx,dy,sigma) * M[x+dx,y+dy]
+     — recoloring stage uses these gradients for feathered blending
+        |
+        v
+  3. Noise threshold  (mask[mask < 0.05] = 0)
+     — removes the faint halo that blur spreads outward
+     — keeps only meaningful transition pixels
+        |
+        v
+  Soft float32 mask  (0.0 -> 1.0, smooth edges, no noise)
+```
+
+### Why keep a soft mask (not binary)?
+
+The recoloring stage multiplies each pixel's colour shift by the mask value.
+A binary mask = hard edge. A soft mask (0.0 → 1.0 gradient) = the colour
+fades in gradually at the boundary — exactly how real paint looks at the edge
+of a taped area. Zero extra cost at blend time; dramatically better result.
+
+### Tunable parameters
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| `EROSION_SIZE` | `5` px | How many pixels to shrink the mask inward |
+| `GAUSSIAN_SIGMA` | `3.0` | Width of the soft feather zone |
+| `GAUSSIAN_KERNEL_SIZE` | `21` | Gaussian window size (must be odd) |
+| `NOISE_THRESHOLD` | `0.05` | Values below this are zeroed out after blur |
+
+### Public API
+
+```python
+from mask_process import process_mask
+
+clean_mask = process_mask(sam_mask)
+# returns: np.ndarray, shape (H, W), dtype float32, values in [0, 1]
+```
+
+### Debug visualisation
+
+```bash
+python mask_process.py room.jpg
+# runs stages 1-3b, saves <stem>_mask_processing.png
+# 4-panel figure: raw mask | processed mask | difference | overlay
 ```
 
 ---
