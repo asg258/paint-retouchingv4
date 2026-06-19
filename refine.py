@@ -483,17 +483,17 @@ def refine_mask_with_sam(
         multimask_output=True,
     )
 
-    # Pick the candidate that best overlaps with the DeepLab mask.
+    # Pick the candidate that best overlaps with the ADE20K coarse mask.
     best_mask = _select_best_mask(sam_masks, sam_scores, coarse_mask)
 
-    # Blend SAM's crisp binary boundary with DeepLab's soft probabilities.
+    # Blend SAM's crisp binary boundary with ADE20K's semantic probabilities.
     refined_mask = _combine_masks(best_mask, coarse_mask)
 
-    # Post-SAM texture suppression:
-    # Even after SAM, M_refined is high in tile regions because M₀ was high
-    # everywhere (DeepLab background = everything).  Suppressing textured
-    # pixels here reduces tile coloring without touching smooth wall planes.
-    refined_mask = texture_suppressed_mask(refined_mask, texture_map)
+    # NOTE: texture_suppressed_mask removed here.
+    # It was needed with DeepLab (where M₀ ≥ 0.608 everywhere, including tile).
+    # With ADE20K the semantic model already outputs near-zero on tile/wood,
+    # so applying additional texture suppression risks over-filtering valid
+    # wall pixels near textured surfaces (e.g. wall behind a wood panel).
 
     # Small dilation to restore continuity in smooth wall planes that SAM
     # may have fragmented.  2px only — reconnects gaps without leaking onto objects.

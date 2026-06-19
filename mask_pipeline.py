@@ -70,24 +70,26 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 # --- Texture (local variance) ---
-VAR_WINDOW_SIZE:  int   = 15    # local window for variance computation (pixels)
-VAR_LAMBDA:       float = 2.0   # suppression strength (lower = softer cutoff)
-# Walls typically have normalised variance < 0.15; tile/wood > 0.25
+VAR_WINDOW_SIZE:  int   = 15
+VAR_LAMBDA:       float = 1.0   # very gentle — ADE20K already handles semantics
 
 # --- Color distance (LAB space) ---
-COLOR_SIGMA:      float = 45.0  # LAB distance bandwidth — wider = more permissive
-# LAB distances: same color ~5, same family ~20, different material ~40+
-# σ=45 accepts anything within ≈1.5 "color families" of the wall
+# Large sigma = permissive: accepts shadowed/lit wall variations.
+# With ADE20K the primary discrimination is semantic, not color-based.
+COLOR_SIGMA:      float = 80.0
 
 # --- Gradient planarity ---
-GRAD_SIGMA:       float = 10.0  # Gaussian sigma for local gradient pooling
-GRAD_LAMBDA:      float = 2.0   # suppression strength (lower = softer cutoff)
+GRAD_SIGMA:       float = 10.0
+GRAD_LAMBDA:      float = 1.0   # very gentle
 
 # --- Combined weight exponent ---
-# W_material = (W_tex × W_col × W_grad)^COMBINATION_POWER
-# Power < 1 softens the multiplicative combination so no single signal
-# can fully zero out a pixel on its own. 0.5 = geometric mean of each pair.
-COMBINATION_POWER: float = 0.5
+COMBINATION_POWER: float = 0.70
+
+# --- Material weight floor ---
+# W_material is clamped to at least this value so the filter can never
+# fully suppress a pixel that the semantic model (ADE20K) already accepted.
+# 0.55 = material filter can reduce mask by at most 45% at any single pixel.
+MATERIAL_FLOOR: float = 0.55
 
 # --- Grid-based patch normalisation ---
 PATCH_SIZE:       int   = 64    # image patch size for grid analysis (pixels)
@@ -386,6 +388,11 @@ def material_aware_mask(
     W_product  = W_tex * W_col * W_grad
     W_material = np.power(W_product, combination_power)
 
+    # Apply material floor: the filter cannot suppress below MATERIAL_FLOOR.
+    # This preserves wall pixels that ADE20K correctly identified but that
+    # have slightly elevated texture/color-distance due to lighting variation.
+    W_material = np.maximum(W_material, MATERIAL_FLOOR).astype(np.float32)
+
     # --- Apply to SAM mask ---
     M_refined  = sam_mask.astype(np.float32) * W_material
 
@@ -545,7 +552,7 @@ def visualize_material_pipeline(
 def _estimate_wall_color(
     image_rgb: np.ndarray,
     mask:      np.ndarray,
-    threshold: float = 0.65,
+    threshold: float = 0.40,   # lowered from 0.65: ADE20K mean ≈ 0.35, 0.65 found too few pixels
 ) -> tuple[int, int, int]:
     """
     Estimate dominant wall color from high-confidence mask pixels using K-means.
