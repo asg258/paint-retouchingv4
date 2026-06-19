@@ -71,25 +71,37 @@ from pathlib import Path
 
 # --- Texture (local variance) ---
 VAR_WINDOW_SIZE:  int   = 15
-VAR_LAMBDA:       float = 1.0   # very gentle — ADE20K already handles semantics
+# Reduced to 0.5: walls are not perfectly flat — mild bumps, paint texture,
+# and shadow gradients all add variance that should not suppress valid wall pixels.
+VAR_LAMBDA:       float = 0.5
 
 # --- Color distance (LAB space) ---
-# Large sigma = permissive: accepts shadowed/lit wall variations.
-# With ADE20K the primary discrimination is semantic, not color-based.
 COLOR_SIGMA:      float = 80.0
 
 # --- Gradient planarity ---
 GRAD_SIGMA:       float = 10.0
-GRAD_LAMBDA:      float = 1.0   # very gentle
+GRAD_LAMBDA:      float = 1.0
 
-# --- Combined weight exponent ---
-COMBINATION_POWER: float = 0.70
+# --- Additive combination weights ---
+# Replaced multiplicative (W_tex × W_col × W_grad) with additive formula.
+# Multiplication amplifies small errors — if any one signal is weak, the
+# product collapses even when the other two are strong. Additive weighting
+# gives smooth influence without catastrophic suppression.
+#
+# W_material = 0.5 + 0.5 × (w_t×W_tex + w_c×W_col + w_g×W_grad)
+#
+# This guarantees W_material ∈ [0.5, 1.0] — the floor is structural,
+# not a parameter. Any pixel gets at minimum 50% of its ADE20K mask value.
+W_TEX_WEIGHT:  float = 0.4   # texture is most discriminative
+W_COL_WEIGHT:  float = 0.3   # color helpful but less reliable in shadows
+W_GRAD_WEIGHT: float = 0.3   # gradient complements texture
 
-# --- Material weight floor ---
-# W_material is clamped to at least this value so the filter can never
-# fully suppress a pixel that the semantic model (ADE20K) already accepted.
-# 0.55 = material filter can reduce mask by at most 45% at any single pixel.
-MATERIAL_FLOOR: float = 0.55
+# --- Strong-wall preservation threshold ---
+# If ADE20K+SAM assigned M_refined > this value, the material filter cannot
+# reduce the final mask below STRONG_WALL_MIN. Protects large vertical wall
+# planes where the semantic model was very confident.
+STRONG_WALL_THRESH: float = 0.70
+STRONG_WALL_MIN:    float = 0.60
 
 # --- Grid-based patch normalisation ---
 PATCH_SIZE:       int   = 64    # image patch size for grid analysis (pixels)
@@ -324,17 +336,15 @@ def grid_patch_normalise(
 # ---------------------------------------------------------------------------
 
 def material_aware_mask(
-    image_rgb:         np.ndarray,
-    sam_mask:          np.ndarray,
-    wall_color_rgb:    tuple[int, int, int] | None = None,
-    var_window:        int   = VAR_WINDOW_SIZE,
-    var_lambda:        float = VAR_LAMBDA,
-    color_sigma:       float = COLOR_SIGMA,
-    grad_lambda:       float = GRAD_LAMBDA,
-    combination_power: float = COMBINATION_POWER,
-    patch_size:        int   = PATCH_SIZE,
-    smooth_sigma:      float = SMOOTH_SIGMA,
-    noise_threshold:   float = NOISE_THRESHOLD,
+    image_rgb:       np.ndarray,
+    sam_mask:        np.ndarray,
+    wall_color_rgb:  tuple[int, int, int] | None = None,
+    var_window:      int   = VAR_WINDOW_SIZE,
+    var_lambda:      float = VAR_LAMBDA,
+    color_sigma:     float = COLOR_SIGMA,
+    grad_lambda:     float = GRAD_LAMBDA,
+    smooth_sigma:    float = SMOOTH_SIGMA,
+    noise_threshold: float = NOISE_THRESHOLD,
 ) -> tuple[np.ndarray, dict]:
     """
     Apply material-aware refinement to a SAM-refined wall mask.
@@ -375,39 +385,57 @@ def material_aware_mask(
     W_col  = compute_color_distance_weight(image_rgb, wall_color_rgb, sigma=color_sigma)
     W_grad = compute_gradient_weight(image_rgb, lam=grad_lambda)
 
-    # --- Combine material weights ---
-    # W_product = W_tex × W_col × W_grad
-    # Pure multiplication is too aggressive when all three are moderately low.
-    # Raising to COMBINATION_POWER < 1 softens the combination:
-    #   power=1.0 → pure product (aggressive)
-    #   power=0.5 → geometric mean of each pair (balanced)
-    #   power=0.33 → cube root (very soft)
-    # A pixel with W_tex=0.6, W_col=0.5, W_grad=0.6 gets:
-    #   power=1.0 → 0.18   (most pixels near-zero)
-    #   power=0.5 → 0.42   (meaningful suppression without collapse)
-    W_product  = W_tex * W_col * W_grad
-    W_material = np.power(W_product, combination_power)
+    # --- Additive material weight ---
+    # W_material = 0.5 + 0.5 × (w_t×W_tex + w_c×W_col + w_g×W_grad)
+    #
+    # Why additive instead of multiplicative:
+    #   Multiplication amplifies errors — if one signal is weak (e.g. W_col=0.3
+    #   in a shadowed wall corner), the product collapses even if W_tex and
+    #   W_grad are strong. This caused large vertical wall planes to disappear.
+    #   Additive combination means each signal contributes proportionally;
+    #   no single signal can catastrophically suppress the mask.
+    #   The 0.5 base offset guarantees W_material ∈ [0.5, 1.0] structurally —
+    #   no separate floor parameter needed.
+    W_material = 0.5 + 0.5 * (
+        W_TEX_WEIGHT  * W_tex  +
+        W_COL_WEIGHT  * W_col  +
+        W_GRAD_WEIGHT * W_grad
+    )
+    W_material = np.clip(W_material, 0.0, 1.0).astype(np.float32)
 
-    # Apply material floor: the filter cannot suppress below MATERIAL_FLOOR.
-    # This preserves wall pixels that ADE20K correctly identified but that
-    # have slightly elevated texture/color-distance due to lighting variation.
-    W_material = np.maximum(W_material, MATERIAL_FLOOR).astype(np.float32)
+    # --- Apply material weight to SAM mask ---
+    M_material = sam_mask.astype(np.float32) * W_material
 
-    # --- Apply to SAM mask ---
-    M_refined  = sam_mask.astype(np.float32) * W_material
+    # --- Strong-wall preservation ---
+    # Where ADE20K+SAM was very confident (M_refined > STRONG_WALL_THRESH),
+    # the material filter cannot reduce the mask below STRONG_WALL_MIN.
+    # This protects large continuous vertical wall planes — exactly the regions
+    # that were disappearing due to mild texture/gradient signals accumulating.
+    strong_wall = sam_mask > STRONG_WALL_THRESH
+    M_material  = np.where(
+        strong_wall,
+        np.maximum(M_material, STRONG_WALL_MIN),
+        M_material,
+    ).astype(np.float32)
 
-    # --- Grid patch normalisation ---
-    # Rescales within each patch so locally-dominant wall regions survive
-    # even if globally suppressed by a slightly elevated material signal.
-    M_grid = grid_patch_normalise(M_refined, patch_size=patch_size)
+    # Grid patch normalisation REMOVED.
+    # It was fragmenting the mask by zeroing pixels below 20% of local_max,
+    # which cut out valid mid-confidence wall regions between strong patches.
 
     # --- Final Gaussian feathering ---
     k = int(smooth_sigma * 6 + 1) | 1
-    M_smooth = cv2.GaussianBlur(M_grid, (k, k), smooth_sigma)
+    M_smooth = cv2.GaussianBlur(M_material, (k, k), smooth_sigma)
 
-    # --- Noise floor ---
+    # --- Noise floor (only removes near-zero halo pixels) ---
     M_smooth[M_smooth < noise_threshold] = 0.0
     M_final = np.clip(M_smooth, 0.0, 1.0).astype(np.float32)
+
+    # --- Mask distribution report ---
+    print(f"[mask_pipeline] M_final — "
+          f"mean={M_final.mean():.3f}  "
+          f"min={M_final.min():.3f}  "
+          f"max={M_final.max():.3f}  "
+          f"coverage={(M_final > 0.3).mean()*100:.1f}%")
 
     debug = {
         "W_texture":   W_tex,
@@ -415,7 +443,7 @@ def material_aware_mask(
         "W_gradient":  W_grad,
         "W_material":  W_material,
         "M_sam_raw":   sam_mask,
-        "M_after_mat": M_refined,
+        "M_after_mat": M_material,
         "M_final":     M_final,
         "wall_color":  wall_color_rgb,
     }
