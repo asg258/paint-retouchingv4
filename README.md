@@ -15,6 +15,7 @@ Built with OpenCV, NumPy, PyTorch, and torchvision.
 | 3b. Mask processing (smooth + erode) | ✅ Done | `mask_process.py` |
 | 5. Object protection mask | ✅ Done | `protect.py` |
 | 6. Wall color detection (K-Means) | ✅ Done | `color_detect.py` |
+| 7. Color layer generation | ✅ Done | `color_layer.py` |
 | 4. LAB wall recoloring | ✅ Done | `recolor.py` |
 | 5. Official color database | ✅ Done | `colors.py` + `colors_valspar.csv` |
 | 6. Post-processing + output | 🔜 Planned | — |
@@ -519,6 +520,96 @@ result.fractions        # (K,) float — fraction of wall area
 python color_detect.py room.jpg
 # runs stages 1–6, saves <stem>_wall_colors.png
 # 3-panel figure: wall overlay | cluster swatches | dominant color swatch
+```
+
+---
+
+## Stage 7 — Color Layer Generation (`color_layer.py`)
+
+Builds the **target reflectance layer** R(x,y) — a full-size (H×W×3) image
+where every pixel is set to the desired paint color, ready to be fed into
+the Stage 8 blending formula.
+
+### The image formation model
+
+Every pixel in a photograph is the product of two signals:
+
+```
+I(x,y) = R_true(x,y) * S(x,y)
+
+  I(x,y)      = observed pixel (what the camera captured)
+  R_true(x,y) = reflectance — the paint color, independent of lighting
+  S(x,y)      = shading — local lighting intensity, shadows, ambient
+```
+
+This is why the same wall looks brighter near a window and darker in a
+corner: `R_true` is the same everywhere, `S(x,y)` varies.
+
+We want to replace `R_true` with `R_target = C_target` while keeping
+`S` untouched. Stage 7 builds `R_target`; Stage 8 does the actual swap.
+
+### Why a full-size image (not just masked pixels)?
+
+Stage 8 runs a vectorized element-wise operation:
+
+```
+O(x,y) = M_final(x,y) * R(x,y) + (1 - M_final(x,y)) * I(x,y)
+```
+
+`R` must be the same shape as `I` and `M_final` so the entire image
+can be computed in one NumPy broadcast — no loops, no indexing tricks.
+The mask decides which pixels matter; `R` just needs to be present everywhere.
+
+### Why masking is NOT applied here
+
+Separation of concerns. This stage only answers **"what color should the
+wall be?"** The **when and where** is entirely Stage 8's responsibility.
+This means:
+- You can swap the target color without touching any mask logic.
+- You can inspect `R(x,y)` independently before running the full pipeline.
+- Reusing the same `R` with a different mask costs zero extra compute.
+
+### Optional: brightness normalization
+
+When `normalize=True`, the target color is scaled to match the original
+wall's brightness:
+
+```
+scale      = ||C_wall|| / ||C_target||      (vector magnitudes)
+R_adjusted = C_target * scale
+```
+
+Useful for dark-to-light or light-to-dark paint swaps where the raw
+target color would otherwise look over- or under-exposed.
+
+### Tunable parameters
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| `BRIGHTNESS_FACTOR` | `1.0` | Multiply L channel — 0.9 = 10% darker |
+| `SATURATION_SCALE` | `1.0` | Scale A/B channels — 1.15 = 15% more vivid |
+| `normalize` (arg) | `False` | Brightness-match target to original wall |
+
+### Public API
+
+```python
+from color_layer import generate_color_layer
+
+layer = generate_color_layer(
+    image,
+    target_color=(115, 70, 130),    # Amethyst Ice RGB
+    dominant_color=(200, 198, 190), # from Stage 6
+    normalize=False,
+)
+# returns: np.ndarray (H, W, 3) uint8 — ready for Stage 8
+```
+
+### Debug visualisation
+
+```bash
+python color_layer.py room.jpg 8001-1G
+# runs stages 1–7, saves <stem>_<code>_color_layer.png
+# 3-panel: original | color layer | preview blend with current mask
 ```
 
 ---
