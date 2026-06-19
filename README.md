@@ -16,6 +16,7 @@ Built with OpenCV, NumPy, PyTorch, and torchvision.
 | 5. Object protection mask | ✅ Done | `protect.py` |
 | 6. Wall color detection (K-Means) | ✅ Done | `color_detect.py` |
 | 7. Color layer generation | ✅ Done | `color_layer.py` |
+| 8. Final blending (Magic-Wall / PRISM) | ✅ Done | `blend.py` |
 | 4. LAB wall recoloring | ✅ Done | `recolor.py` |
 | 5. Official color database | ✅ Done | `colors.py` + `colors_valspar.csv` |
 | 6. Post-processing + output | 🔜 Planned | — |
@@ -695,6 +696,98 @@ list_families()
 python colors.py                  # shows sample colors from each family
 python colors.py "Lucy Blue"      # exact + fuzzy results for any query
 python colors.py warm beige       # multi-word queries work too
+```
+
+---
+
+## Stage 8 — Final Blending (`blend.py`)
+
+Combines the original image I(x,y), the target color layer R(x,y) from
+Stage 7, and the final mask M_final(x,y) from Stage 5 into the output.
+
+### The Magic-Wall / PRISM formula
+
+```
+O(x,y) = M_final(x,y) * R(x,y) + (1 - M_final(x,y)) * I(x,y)
+
+  M = 1  →  pixel is fully recolored  (deep wall interior)
+  M = 0  →  pixel is untouched        (furniture, protected region)
+  0<M<1  →  smooth linear transition  (boundary pixels)
+```
+
+### Why a soft mask produces natural results
+
+A binary mask draws a hard edge between wall and non-wall. Real walls
+meet furniture at curves, folds, and compressed texture — a hard seam
+would be immediately visible. The soft mask encodes per-pixel confidence
+so the colour change fades in gradually across the boundary, the same way
+a real paint job feathers at a masked-off edge.
+
+### How blending approximates I = R × S
+
+The ideal operation under the image formation model would be:
+```
+O = R_target × S   where   S = I / R_true
+```
+We don't know R_true exactly, so instead:
+- Where **M = 1** the output is exactly R_target (the new reflectance).
+- Where **M = 0** the output is I, which already encodes R_true × S.
+- The soft transition zone naturally carries shading information from the
+  original image into the boundary pixels via the (1-M) × I term.
+
+### Two blend modes
+
+| Mode | How it works | Best for |
+|---|---|---|
+| `"rgb"` (default) | Linear blend on all three channels | Most rooms; fast |
+| `"hsv"` | Keep original V (brightness), blend only H and S | Strongly-lit rooms; preserves shadows and highlights more precisely |
+
+**HSV mode** directly implements "replace reflectance, keep shading":
+```
+H_out = blend(H_target, H_orig, M)   — hue changes to new paint color
+S_out = blend(S_target, S_orig, M)   — saturation changes
+V_out = V_orig                        — brightness ALWAYS from original
+```
+Hue blending uses circular wrapping so colors near 0°/360° blend through
+the short arc instead of spinning around the color wheel.
+
+### Why Steps 5 and 7 must exist before this step
+
+- **Step 5 (protection mask)** sets M_final = 0 on all object pixels, so
+  the `M * R` term is zero there — furniture is guaranteed untouched.
+- **Step 7 (color layer)** is a separate pre-built array because the blend
+  formula is a single vectorized broadcast: `O = M*R + (1-M)*I`. R must
+  already be the right shape so NumPy can compute the whole image in one
+  step with no Python loops.
+
+### Public API
+
+```python
+from blend import blend_images
+
+output = blend_images(
+    image=preprocessed,          # (H, W, 3) uint8 RGB
+    color_layer=layer,           # (H, W, 3) uint8 from Stage 7
+    mask=final_mask,             # (H, W)    float32 from Stage 5
+    mode="rgb",                  # or "hsv" for lighting-heavy rooms
+)
+# returns: (H, W, 3) uint8 RGB — final recolored image
+```
+
+### Run it end-to-end
+
+```bash
+# RGB blend (default)
+python blend.py room.jpg 8001-1G
+
+# HSV blend (preserves original lighting)
+python blend.py room.jpg 8001-1G --hsv
+```
+
+Output files:
+```
+room_8001-1G_rgb_blend.jpg              ← full-resolution result
+room_8001-1G_rgb_blend_comparison.png   ← 4-panel figure
 ```
 
 ---
