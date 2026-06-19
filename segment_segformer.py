@@ -162,29 +162,32 @@ def load_segformer(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Check for a local copy first (useful on networks that block HuggingFace).
-    local_dir = Path(__file__).parent / "segformer_model"
-    source    = str(local_dir) if local_dir.exists() else model_id
+    ckpt_path = Path(__file__).parent / "segformer_model" / "segformer.b2.512x512.ade.160k.pth"
 
-    if local_dir.exists():
-        print(f"[segformer] Loading from local directory: {local_dir}")
-    else:
-        print(f"[segformer] Loading {model_id} on {device} ...")
-        print("[segformer] (First run downloads ~100 MB of weights from HuggingFace.)")
-        print("[segformer] If download fails (corporate network), manually download files from:")
-        print("[segformer]   https://huggingface.co/nvidia/segformer-b2-finetuned-ade-512-512/tree/main")
-        print(f"[segformer] and save them to: {local_dir}")
+    if not ckpt_path.exists():
+        print(f"[segformer] Weights not found at {ckpt_path}")
+        print("[segformer] Downloading from NVlabs Google Drive ...")
+        sys.path.insert(0, str(Path(__file__).parent / "segformer_model"))
+        from download_weights import download
+        if not download():
+            raise FileNotFoundError(
+                f"Could not download SegFormer weights.\n"
+                f"Please download manually from:\n"
+                f"  https://drive.google.com/file/d/1ILRqSCMB7zBgK3JlSN_hNZoGKWYDi4IK/view\n"
+                f"and save to: {ckpt_path}"
+            )
 
-    processor = AutoImageProcessor.from_pretrained(source)
-    model     = SegformerForSemanticSegmentation.from_pretrained(source)
+    print(f"[segformer] Loading NVlabs SegFormer-B2 ADE20K on {device} ...")
+    sys.path.insert(0, str(Path(__file__).parent / "segformer_model"))
+    from segformer_pytorch import SegFormerB2ADE20K, load_nvlabs_weights
+
+    model = SegFormerB2ADE20K()
+    load_nvlabs_weights(model, str(ckpt_path))
     model.to(device)
     model.eval()
 
-    # Confirm the wall class index from the model's own label map.
-    wall_label = model.config.id2label.get(WALL_CLASS_INDEX, "?")
-    print(f"[segformer] Ready. Class {WALL_CLASS_INDEX} = '{wall_label}' (expect 'wall')")
-
-    return model, processor, device
+    print(f"[segformer] Ready. Class {WALL_CLASS_INDEX} = 'wall' (ADE20K).")
+    return model, None, device   # processor=None; model handles preprocessing
 
 
 # ---------------------------------------------------------------------------
@@ -230,46 +233,17 @@ def get_segformer_mask(
         wall_mask: (H, W) float32 array, values in [0, 1].
                    Each value is P(wall | pixel) under the ADE20K taxonomy.
     """
-    if model is None or processor is None:
-        model, processor, device = load_segformer(device=device)
-    if device is None:
-        device = next(model.parameters()).device
+    if model is None:
+        model, _, device = load_segformer(device=device)
 
-    h_orig, w_orig = image.shape[:2]
+    # Preprocessing + inference + softmax + wall extraction all handled by
+    # SegFormerB2ADE20K.predict_wall_mask() — no external processor needed.
+    wall_mask = model.predict_wall_mask(image)
 
-    # Preprocess: normalise and tensorise for the SegFormer processor.
-    pil_image = Image.fromarray(image)
-    inputs    = processor(images=pil_image, return_tensors="pt")
-    inputs    = {k: v.to(device) for k, v in inputs.items()}
-
-    # Forward pass — no gradients needed at inference.
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    # logits: (1, 150, H/4, W/4)
-    logits = outputs.logits
-
-    # Upsample back to original image resolution using bilinear interpolation.
-    logits_up = F.interpolate(
-        logits,
-        size=(h_orig, w_orig),
-        mode="bilinear",
-        align_corners=False,
-    )   # (1, 150, H, W)
-
-    # Softmax: convert logits to class probability distribution per pixel.
-    probs = F.softmax(logits_up, dim=1)   # (1, 150, H, W)
-
-    # Extract wall class (index 0 = "wall" in ADE20K).
-    wall_prob = probs[0, WALL_CLASS_INDEX]  # (H, W)
-
-    wall_mask = wall_prob.cpu().numpy().astype(np.float32)
-
-    # Diagnostic printout.
     wall_pct = float((wall_mask > WALL_CONFIDENCE_THRESHOLD).mean() * 100)
     print(f"[segformer] Wall mask: range=[{wall_mask.min():.3f}, {wall_mask.max():.3f}]  "
           f"mean={wall_mask.mean():.3f}  "
-          f"coverage={wall_pct:.1f}% (pixels > {WALL_CONFIDENCE_THRESHOLD})")
+          f"coverage={wall_pct:.1f}% (ADE20K class 0 = wall)")
 
     return wall_mask
 
