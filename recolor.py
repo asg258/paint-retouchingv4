@@ -286,9 +286,19 @@ def run_pipeline(
     print(f"[stage3b] Clean mask range: [{clean_mask.min():.3f}, {clean_mask.max():.3f}]  "
           f"mean={clean_mask.mean():.3f}")
 
+    # Stage 5: Object protection mask — build a safety buffer around objects
+    # so color cannot bleed onto furniture, appliances, or decor.
+    print("\n--- Stage 5: Object protection mask ---")
+    from protect import create_object_protection_mask, apply_protection
+    protection_mask = create_object_protection_mask(clean_mask)
+    final_mask      = apply_protection(clean_mask, protection_mask)
+    print(f"[stage5] Protection covers {protection_mask.mean()*100:.1f}% of image")
+    print(f"[stage5] Final mask range: [{final_mask.min():.3f}, {final_mask.max():.3f}]  "
+          f"mean={final_mask.mean():.3f}")
+
     # Stage 4: Recolor using the resolved paint color
     print("\n--- Stage 4: Recoloring ---")
-    recolored = recolor_walls(preprocessed, clean_mask, color=color)
+    recolored = recolor_walls(preprocessed, final_mask, color=color)
 
     # Save outputs — name files after the color code so you can compare easily.
     safe_code  = color.code.replace("/", "-")
@@ -302,7 +312,7 @@ def run_pipeline(
     )
     print(f"[stage4] Recolored image saved: {out_recolored}")
 
-    save_comparison(preprocessed, recolored, clean_mask, color, out_comparison)
+    save_comparison(preprocessed, recolored, final_mask, color, out_comparison)
 
     print(f"\nDone.")
     print(f"   Color     : {color.code}  {color.name}  #{color.hex}")

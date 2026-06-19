@@ -13,6 +13,7 @@ Built with OpenCV, NumPy, PyTorch, and torchvision.
 | 2. DeepLabV3 semantic segmentation | ✅ Done | `segment.py` |
 | 3. SAM boundary refinement | ✅ Done | `refine.py` |
 | 3b. Mask processing (smooth + erode) | ✅ Done | `mask_process.py` |
+| 5. Object protection mask | ✅ Done | `protect.py` |
 | 4. LAB wall recoloring | ✅ Done | `recolor.py` |
 | 5. Official color database | ✅ Done | `colors.py` + `colors_valspar.csv` |
 | 6. Post-processing + output | 🔜 Planned | — |
@@ -355,6 +356,85 @@ clean_mask = process_mask(sam_mask)
 python mask_process.py room.jpg
 # runs stages 1-3b, saves <stem>_mask_processing.png
 # 4-panel figure: raw mask | processed mask | difference | overlay
+```
+
+---
+
+## Stage 5 — Object Protection Mask (`protect.py`)
+
+Builds a **safety buffer around every non-wall region** so the recoloring
+step can never bleed onto furniture, appliances, or decor — even if the wall
+mask is slightly imperfect.
+
+### Why Stages 3–4 are still not enough
+
+Stage 3b (erosion) and Stage 3 (SAM) both reduce bleed from the **wall side**:
+they shrink and clean the wall mask. But there are three remaining failure modes:
+
+| Failure | Root cause | Why erosion/SAM can't fix it alone |
+|---|---|---|
+| Sub-pixel aliasing at boundary | Edge pixels are a blend of wall + object colours | Even a perfect mask claims some object pixels |
+| JPEG / compression artifacts | Block artefacts shift apparent boundary by 2–4 px | The mask follows the compressed boundary, not the true one |
+| Low-confidence wall creep | DeepLab assigns P(wall)=0.15 to sofa cushion | Doesn't look bad in the mask but still gets a faint tint |
+
+Stage 5 attacks the problem from the **object side**: expand every object's
+footprint outward so it over-claims, rather than under-claims, its territory.
+
+### Mathematical formulation
+
+```
+Object mask (raw):
+    M_obj = 1 - M_wall
+
+Dilated protection zone:
+    M_protect = M_obj ⊕ K       (⊕ = morphological dilation, K = ellipse kernel)
+
+Optional soft edge:
+    M_protect = GaussianBlur(M_protect, sigma)
+
+Final safe-to-recolor mask:
+    M_final = M_wall * (1 - M_protect)
+
+Blending formula (Stage 8):
+    Output = M_final * Recolored + (1 - M_final) * Original
+```
+
+### How dilation prevents bleeding
+
+Dilation replaces each pixel with the **maximum** value in its neighbourhood.
+Applied to the object mask, it expands every object outward by `dilation_size`
+pixels. Any wall pixel within that buffer gets a protection value close to 1,
+which zeroes it in `M_final` — the recoloring step never sees it.
+
+Think of it as painter's tape: erosion tidies up the brush, but tape
+guarantees zero bleed regardless of brush quality.
+
+### Tunable parameters
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| `DILATION_SIZE` | `10` px | Width of the safety buffer around objects |
+| `PROTECTION_SIGMA` | `2.0` | Gaussian sigma to soften the protection edge |
+| `PROTECTION_KERNEL_SIZE` | `15` | Gaussian kernel size (must be odd) |
+
+### Public API
+
+```python
+from protect import create_object_protection_mask, apply_protection
+
+protection_mask = create_object_protection_mask(clean_mask)
+# returns: (H, W) float32, 1 = protected, 0 = safe to recolor
+
+final_mask = apply_protection(clean_mask, protection_mask)
+# returns: M_wall * (1 - M_protect), ready for blending
+```
+
+### Debug visualisation
+
+```bash
+python protect.py room.jpg
+# runs stages 1–5, saves <stem>_protection.png
+# 5-panel figure: wall mask | object mask | protection | final | overlay
 ```
 
 ---
