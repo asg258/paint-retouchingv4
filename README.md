@@ -11,8 +11,9 @@ Built with OpenCV, NumPy, PyTorch, and torchvision.
 |-------|--------|------|
 | 1. Image loading + LAB preprocessing | ✅ Done | `preprocess.py` |
 | 2. DeepLabV3 semantic segmentation | ✅ Done | `segment.py` |
-| 3. Color transfer / recoloring | 🔜 Planned | — |
-| 4. Post-processing + output | 🔜 Planned | — |
+| 3. SAM boundary refinement | ✅ Done | `refine.py` |
+| 4. Color transfer / recoloring | 🔜 Planned | — |
+| 5. Post-processing + output | 🔜 Planned | — |
 
 ---
 
@@ -162,10 +163,130 @@ python segment.py room.jpg
 
 ---
 
+## Stage 3 — SAM Boundary Refinement (`refine.py`)
+
+DeepLabV3 gives us a good first approximation of where the wall is, but its
+boundaries are blurry.  This stage runs Meta's **Segment Anything Model (SAM)**
+to fix that: crisp edges, accurate corners, fine details recovered.
+
+### Why DeepLab boundaries are blurry
+
+CNNs process images through stacked convolution layers.  Each convolution
+averages pixels inside a small window, and by the time you're 50 layers deep,
+the network "sees" a large region rather than a single pixel.  This is great
+for recognising objects but terrible for drawing precise boundaries — the wall/
+sofa edge comes out as a gradient of uncertain pixels several pixels wide.
+
+### How SAM fixes it
+
+SAM uses a **Vision Transformer (ViT)** that encodes the entire image in one
+shot, giving it global context.  Its mask decoder was specifically trained to
+produce sharp, pixel-accurate boundaries.  Crucially, SAM is **promptable** —
+it doesn't try to classify every pixel; instead, it draws a mask around
+whatever region you point it at.
+
+### How we drive SAM from the coarse mask
+
+```
+Coarse DeepLab mask (H, W) float32
+            │
+            ▼
+  Threshold into three zones:
+  - P > 0.70  → confident wall       → foreground prompts (label = 1)
+  - P < 0.30  → confident background → background prompts (label = 0)
+  - 0.30–0.70 → uncertain            → ignored (let SAM decide)
+            │
+            ▼
+  Sample a sparse grid of prompt coordinates
+  from each zone (max 8 fg + 4 bg points)
+            │
+            ▼
+  predictor.set_image(rgb)   ← encodes image once (~0.1–1 s)
+  predictor.predict(coords, labels, multimask_output=True)
+            │
+            ▼
+  SAM returns 3 candidate binary masks + confidence scores
+            │
+            ▼
+  Select best candidate by IoU vs coarse mask (tie-break: SAM score)
+            │
+            ▼
+  Combine:  M_refined = SAM_binary × M_coarse
+  (SAM sets the boundary, DeepLab supplies soft interior confidence)
+            │
+            ▼
+  float32 (H, W) refined probability mask
+```
+
+### Why SAM output is binary — and why we don't keep it that way
+
+SAM's decoder produces a 0/1 mask.  There is no "I'm 73 % sure this is wall"
+signal — it just draws a boundary and fills.  That's fine for edges, but it
+destroys the interior confidence information that DeepLab carefully computed.
+By multiplying `SAM_binary × M_coarse` we get both: SAM's precise edge AND
+DeepLab's soft confidence inside the mask.  Downstream blending stages need
+those interior gradients to create natural-looking colour transitions.
+
+### Setup (extra step required)
+
+```bash
+# 1. Install the package
+pip install git+https://github.com/facebookresearch/segment-anything.git
+
+# 2. Download a checkpoint (ViT-B is the best balance of speed and accuracy)
+wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+# or for maximum quality:
+# wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+```
+
+Update `SAM_CHECKPOINT` and `SAM_MODEL_TYPE` at the top of `refine.py` if you
+use a different checkpoint.
+
+### Tunable parameters
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| `SAM_CHECKPOINT` | `"sam_vit_b_01ec64.pth"` | Path to the downloaded checkpoint |
+| `SAM_MODEL_TYPE` | `"vit_b"` | Must match the checkpoint (`vit_b`, `vit_l`, `vit_h`) |
+| `FG_THRESHOLD` | `0.70` | Mask values above this become foreground prompts |
+| `BG_THRESHOLD` | `0.30` | Mask values below this become background prompts |
+| `MAX_FG_POINTS` | `8` | Maximum number of foreground prompt points |
+| `MAX_BG_POINTS` | `4` | Maximum number of background prompt points |
+| `POINT_GRID_SPACING` | `30` | Pixel spacing of the sampling grid |
+
+### Public API
+
+```python
+from refine import load_sam_model, refine_mask_with_sam
+
+predictor, device = load_sam_model()   # load once
+
+refined_mask = refine_mask_with_sam(
+    image=preprocessed_rgb,   # (H, W, 3) uint8 RGB
+    coarse_mask=deeplab_mask, # (H, W) float32 from Stage 2
+    predictor=predictor,
+)
+# returns: np.ndarray, shape (H, W), dtype float32, values in [0, 1]
+# edges are sharper than the input coarse_mask
+```
+
+### Debug visualisation
+
+```bash
+python refine.py room.jpg
+# runs all 3 stages end-to-end, opens a 4-panel figure:
+#   original + prompts | coarse mask | refined mask | difference
+# saves <image_stem>_refined_mask.png
+```
+
+---
+
 ## Setup
 
 ```bash
 pip install opencv-python numpy torch torchvision matplotlib pillow
+# For Stage 3 also:
+pip install git+https://github.com/facebookresearch/segment-anything.git
 ```
 
 ---
