@@ -97,22 +97,43 @@ W_COL_WEIGHT:  float = 0.3   # color helpful but less reliable in shadows
 W_GRAD_WEIGHT: float = 0.3   # gradient complements texture
 
 # --- Strong-wall preservation threshold ---
-# If ADE20K+SAM assigned M_refined > this value, the material filter cannot
-# reduce the final mask below STRONG_WALL_MIN. Protects large vertical wall
-# planes where the semantic model was very confident.
 STRONG_WALL_THRESH: float = 0.70
 STRONG_WALL_MIN:    float = 0.60
 
-# --- Grid-based patch normalisation ---
-PATCH_SIZE:       int   = 64    # image patch size for grid analysis (pixels)
-PATCH_FLOOR:      float = 0.20  # within a patch, wall pixels below this get zeroed
+# --- Periodic texture penalty (tile grout detection) ---
+# Tile surfaces have structured, repeating Laplacian patterns.
+# We detect this via the variance of the Laplacian (variance-of-edges),
+# which is high for periodic grout-line patterns and low for smooth paint.
+TILE_VAR_WINDOW: int   = 15     # local window for Laplacian variance
+TILE_LAMBDA:     float = 3.0    # suppression strength (higher = harder cut)
+TILE_VAR_THRESH: float = 0.15   # normalised Laplacian variance above which
+                                 # the tile penalty activates
+
+# --- Reflection / specular penalty (mirror / glass detection) ---
+# Mirrors and polished glass appear as regions with high per-pixel RGB channel
+# variance (reflected scene has different hue ratios than a painted wall) plus
+# high local hue variation (the reflected scene contains many different colors).
+REFLECT_RGB_SIGMA:  float = 25.0  # suppression strength for inter-channel variance
+REFLECT_HUE_WINDOW: int   = 21    # window for local hue std-dev computation
+REFLECT_HUE_THRESH: float = 0.20  # normalised hue-std above which reflection
+                                   # penalty activates
+
+# --- Gaussian color distance (Step 3) ---
+# Replaced exp(-d/σ) with exp(-d²/2σ²) for sharper discrimination:
+# similar colors remain near 1, different materials drop faster at large d.
+COLOR_SIGMA_GAUSS: float = 40.0   # Gaussian σ in LAB units (replaces COLOR_SIGMA)
+
+# --- Connected-component filtering (Step 4) ---
+# Remove isolated mask regions that are too small to be real wall planes.
+MIN_COMPONENT_PX: int   = 800    # components smaller than this are zeroed
+COMPONENT_THRESH: float = 0.35   # binarise threshold for component analysis
 
 # --- Final smoothing ---
-SMOOTH_SIGMA:     float = 2.0   # Gaussian sigma for final edge feathering
-SMOOTH_KERNEL:    int   = 15    # must be odd
+SMOOTH_SIGMA:     float = 2.0
+SMOOTH_KERNEL:    int   = 15
 
 # --- Noise cleanup ---
-NOISE_THRESHOLD:  float = 0.05  # values below this zeroed after all processing
+NOISE_THRESHOLD:  float = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +196,7 @@ def compute_local_variance(
 def compute_color_distance_weight(
     image_rgb:  np.ndarray,
     wall_color_rgb: tuple[int, int, int],
-    sigma:      float = COLOR_SIGMA,
+    sigma:      float = COLOR_SIGMA_GAUSS,   # now uses Gaussian formula
 ) -> np.ndarray:
     """
     Compute a per-pixel color weight based on LAB distance from wall color.
@@ -219,7 +240,11 @@ def compute_color_distance_weight(
     diff     = lab_img - wall_lab[np.newaxis, np.newaxis, :]  # (H, W, 3)
     dist     = np.sqrt(np.sum(diff**2, axis=2))               # (H, W)
 
-    return np.exp(-dist / sigma).astype(np.float32)
+    # Gaussian formula: exp(−d²/2σ²) gives sharper discrimination than
+    # the linear-decay exp(−d/σ). At d=σ, both give similar values,
+    # but at d=2σ the Gaussian drops faster — different materials (tile,
+    # wood, granite) at d≈50–80 LAB units are more strongly suppressed.
+    return np.exp(-(dist ** 2) / (2.0 * sigma ** 2)).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -279,56 +304,164 @@ def compute_gradient_weight(
 
 
 # ---------------------------------------------------------------------------
-# 4. Grid-Based Patch Normalisation
+# NEW — Periodic Texture Penalty (tile grout detection)
 # ---------------------------------------------------------------------------
 
-def grid_patch_normalise(
-    mask:       np.ndarray,
-    patch_size: int   = PATCH_SIZE,
-    floor:      float = PATCH_FLOOR,
+def compute_periodic_texture_penalty(
+    image_rgb:   np.ndarray,
+    window:      int   = TILE_VAR_WINDOW,
+    lam:         float = TILE_LAMBDA,
+    var_thresh:  float = TILE_VAR_THRESH,
 ) -> np.ndarray:
     """
-    Normalise mask values within each image patch to preserve local continuity.
+    Detect periodic, structured texture (tile grout) using variance-of-Laplacian.
 
-    WHY THIS IS NEEDED
-    ------------------
-    After material suppression, some image patches may have been globally
-    suppressed (e.g. the entire upper-left patch of a wall was identified as
-    slightly textured). Within such a patch, the relative ordering of
-    confidence values is still meaningful — the pixels with relatively higher
-    values are more likely wall than their neighbours.
+    WHY: The Laplacian |∇²I| has high magnitude at every edge. For smooth paint,
+    edges are sparse and the local variance of the Laplacian is LOW. For tile,
+    the regular grout-line pattern produces a dense, periodically-repeating
+    Laplacian signal whose local variance is HIGH. This distinguishes tile from
+    paint better than simple gradient magnitude because it responds to
+    REGULARITY, not just the presence of edges.
 
-    Grid normalisation prevents a mildly-suppressed patch from being entirely
-    zeroed out. It rescales each patch so its maximum value is preserved, then
-    applies the floor threshold to remove noise within the patch.
+    Formula:
+        L(x,y)      = |∇² I_gray|
+        μ_L         = boxFilter(L, window)
+        μ_L²        = boxFilter(L², window)
+        VarL(x,y)   = μ_L² − (μ_L)²            [local variance of Laplacian]
+        VarL_norm   = clip(VarL / percentile₉₅, 0, 1)
+        W_tile      = exp(−λ × max(0, VarL_norm − thresh))
 
-    Formula (per patch P_ij):
-        max_p       = max(mask, P_ij)
-        if max_p > 0:
-            mask[P_ij] = mask[P_ij] / max_p × max_p   (no-op: keeps scale)
-        mask[P_ij < floor × max_p] = 0
-
-    This is a soft floor: within each patch, pixels below floor × local_max
-    are zeroed, preserving the strongest wall signal in each region.
-
-    Args:
-        mask:       (H, W) float32 mask.
-        patch_size: Patch size in pixels.
-        floor:      Relative threshold within each patch.
+    The threshold means the penalty only activates above a minimum variance
+    level, so smooth-but-textured materials (e.g. slightly rough plaster) are
+    not incorrectly penalised.
 
     Returns:
-        normalised: (H, W) float32.
+        W_tile: (H, W) float32, values ∈ (0, 1]. Low = tile-like. High = smooth.
     """
-    h, w  = mask.shape
-    out   = mask.copy()
-    for y in range(0, h, patch_size):
-        for x in range(0, w, patch_size):
-            patch = out[y:y+patch_size, x:x+patch_size]
-            p_max = float(patch.max())
-            if p_max > 0:
-                # Zero out pixels below floor × local_max within this patch
-                patch[patch < floor * p_max] = 0.0
-    return out
+    bgr  = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    lap  = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+
+    k = (window, window)
+    mu_L  = cv2.boxFilter(lap,    cv2.CV_32F, k, normalize=True)
+    mu_L2 = cv2.boxFilter(lap**2, cv2.CV_32F, k, normalize=True)
+    var_L = np.clip(mu_L2 - mu_L**2, 0, None)
+
+    p95      = float(np.percentile(var_L, 95)) + 1e-6
+    var_norm = np.clip(var_L / p95, 0.0, 1.0)
+
+    # Penalty activates only above the threshold to avoid false positives on
+    # rough plaster or embossed wallpaper that isn't actually tile.
+    excess   = np.maximum(var_norm - var_thresh, 0.0)
+    W_tile   = np.exp(-lam * excess).astype(np.float32)
+
+    return W_tile
+
+
+# ---------------------------------------------------------------------------
+# NEW — Reflection / Specular Penalty (mirror and glass detection)
+# ---------------------------------------------------------------------------
+
+def compute_reflection_penalty(
+    image_rgb:   np.ndarray,
+    rgb_sigma:   float = REFLECT_RGB_SIGMA,
+    hue_window:  int   = REFLECT_HUE_WINDOW,
+    hue_thresh:  float = REFLECT_HUE_THRESH,
+) -> np.ndarray:
+    """
+    Suppress mask on mirror and reflective glass surfaces.
+
+    WHY: A painted wall has a consistent single color across the surface —
+    per-pixel variance across the R, G, B channels is LOW (all three
+    channels track the same painted tone). A mirror reflects diverse scene
+    content (furniture, towels, sky through a window), so the R, G, B values
+    at adjacent pixels change independently → high inter-channel variance
+    AND high local hue variation.
+
+    Two signals combined:
+    1. Inter-channel RGB variance:
+           var_rgb(x,y) = Var([R,G,B]) per pixel
+           W_rgb        = exp(−var_rgb² / (2·rgb_sigma²))
+       Low on uniform painted surfaces. High on color-diverse reflections.
+
+    2. Local circular hue standard deviation:
+           Hue_local_std = std(H in local window), using circular statistics
+           W_hue         = 1 if std < hue_thresh, ramps to 0 above
+       A wall has nearly constant hue. A mirror reflection contains many hues.
+
+    Final: W_reflect = W_rgb × W_hue  (both must be clean to pass)
+
+    Returns:
+        W_reflect: (H, W) float32, values ∈ (0, 1]. Low = likely reflection.
+    """
+    bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+
+    # --- Signal 1: per-pixel inter-channel variance ---
+    img_f   = image_rgb.astype(np.float32)
+    mean_ch = img_f.mean(axis=2, keepdims=True)
+    var_rgb = np.mean((img_f - mean_ch) ** 2, axis=2)   # (H, W)
+    p95_rgb = float(np.percentile(var_rgb, 95)) + 1e-6
+    var_rgb_norm = np.clip(var_rgb / p95_rgb, 0.0, 1.0)
+    W_rgb   = np.exp(-(var_rgb_norm ** 2) / (2 * (rgb_sigma / 100.0) ** 2))
+
+    # --- Signal 2: local hue circular std-dev ---
+    # Hue in OpenCV: 0–180. Convert to unit circle for circular statistics.
+    H    = hsv[:, :, 0]
+    theta = H * (np.pi / 90.0)   # map [0,180] → [0, 2π]
+    sin_t = cv2.boxFilter(np.sin(theta).astype(np.float32), cv2.CV_32F,
+                          (hue_window, hue_window), normalize=True)
+    cos_t = cv2.boxFilter(np.cos(theta).astype(np.float32), cv2.CV_32F,
+                          (hue_window, hue_window), normalize=True)
+    R_bar     = np.sqrt(sin_t**2 + cos_t**2)          # circular mean length
+    hue_std   = np.sqrt(np.clip(1.0 - R_bar, 0, 1))   # circular std ∈ [0,1]
+    # Suppress where local hue std exceeds the threshold.
+    hue_excess = np.maximum(hue_std - hue_thresh, 0.0)
+    W_hue      = np.exp(-5.0 * hue_excess).astype(np.float32)
+
+    return (W_rgb * W_hue).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# NEW — Small Component Filter (Step 4)
+# ---------------------------------------------------------------------------
+
+def filter_small_components(
+    mask:       np.ndarray,
+    threshold:  float = COMPONENT_THRESH,
+    min_pixels: int   = MIN_COMPONENT_PX,
+) -> np.ndarray:
+    """
+    Remove small isolated mask regions that cannot be real wall planes.
+
+    Real painted wall surfaces are large and continuous. Isolated blobs of
+    a few hundred pixels are almost certainly:
+        - Texture artifacts (grout patches that slipped through W_tile)
+        - Reflection fragments (mirror edge leakage)
+        - Segmentation noise
+
+    Method: binarise at threshold, compute connected components, zero out
+    components below min_pixels, apply as a multiplicative gate on the
+    soft mask to preserve the original probability values in kept regions.
+
+    Args:
+        mask:       (H, W) float32 soft mask.
+        threshold:  Binarisation level for component analysis.
+        min_pixels: Components smaller than this are removed.
+
+    Returns:
+        filtered: (H, W) float32 — small components zeroed, others unchanged.
+    """
+    binary    = (mask > threshold).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
+
+    keep = np.zeros_like(binary)
+    for i in range(1, n_labels):   # skip label 0 = background
+        if stats[i, cv2.CC_STAT_AREA] >= min_pixels:
+            keep[labels == i] = 1
+
+    return (mask * keep.astype(np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -380,22 +513,12 @@ def material_aware_mask(
     if wall_color_rgb is None:
         wall_color_rgb = _estimate_wall_color(image_rgb, sam_mask)
 
-    # --- Compute three material weight maps ---
+    # --- Compute base material weight maps ---
     W_tex  = compute_local_variance(image_rgb, window_size=var_window, lam=var_lambda)
     W_col  = compute_color_distance_weight(image_rgb, wall_color_rgb, sigma=color_sigma)
     W_grad = compute_gradient_weight(image_rgb, lam=grad_lambda)
 
-    # --- Additive material weight ---
-    # W_material = 0.5 + 0.5 × (w_t×W_tex + w_c×W_col + w_g×W_grad)
-    #
-    # Why additive instead of multiplicative:
-    #   Multiplication amplifies errors — if one signal is weak (e.g. W_col=0.3
-    #   in a shadowed wall corner), the product collapses even if W_tex and
-    #   W_grad are strong. This caused large vertical wall planes to disappear.
-    #   Additive combination means each signal contributes proportionally;
-    #   no single signal can catastrophically suppress the mask.
-    #   The 0.5 base offset guarantees W_material ∈ [0.5, 1.0] structurally —
-    #   no separate floor parameter needed.
+    # --- Additive base material weight (preserves large wall planes) ---
     W_material = 0.5 + 0.5 * (
         W_TEX_WEIGHT  * W_tex  +
         W_COL_WEIGHT  * W_col  +
@@ -403,14 +526,27 @@ def material_aware_mask(
     )
     W_material = np.clip(W_material, 0.0, 1.0).astype(np.float32)
 
-    # --- Apply material weight to SAM mask ---
-    M_material = sam_mask.astype(np.float32) * W_material
+    # --- Targeted suppressions (multiplicative, applied AFTER the additive base) ---
+    # These are designed for specific failure modes: tile and mirrors.
+    # They are multiplicative because they represent hard physical evidence
+    # ("this IS tile", "this IS a mirror") that should override the base weight.
+
+    # Periodic texture penalty — suppresses tile grout patterns.
+    W_tile    = compute_periodic_texture_penalty(image_rgb)
+    # Reflection penalty — suppresses mirror and polished glass.
+    W_reflect = compute_reflection_penalty(image_rgb)
+
+    # Apply targeted suppressions to the base weight.
+    W_combined = W_material * W_tile * W_reflect
+    W_combined = np.clip(W_combined, 0.0, 1.0).astype(np.float32)
+
+    # --- Apply to SAM mask ---
+    M_material = sam_mask.astype(np.float32) * W_combined
 
     # --- Strong-wall preservation ---
-    # Where ADE20K+SAM was very confident (M_refined > STRONG_WALL_THRESH),
-    # the material filter cannot reduce the mask below STRONG_WALL_MIN.
-    # This protects large continuous vertical wall planes — exactly the regions
-    # that were disappearing due to mild texture/gradient signals accumulating.
+    # Where ADE20K+SAM was very confident, the combined filter cannot override it.
+    # This is applied AFTER the targeted suppressions so tile/mirror suppression
+    # still works even in high-confidence regions.
     strong_wall = sam_mask > STRONG_WALL_THRESH
     M_material  = np.where(
         strong_wall,
@@ -418,15 +554,22 @@ def material_aware_mask(
         M_material,
     ).astype(np.float32)
 
-    # Grid patch normalisation REMOVED.
-    # It was fragmenting the mask by zeroing pixels below 20% of local_max,
-    # which cut out valid mid-confidence wall regions between strong patches.
+    # --- Morphological opening (Step 5): remove thin streaks and noise ---
+    # A small 3×3 open removes isolated pixel noise and thin vertical/horizontal
+    # artifacts without affecting large continuous wall regions.
+    open_k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    M_opened  = cv2.morphologyEx(M_material, cv2.MORPH_OPEN, open_k)
+
+    # --- Connected component filtering (Step 4): remove isolated blobs ---
+    # Real wall planes are large. Anything under MIN_COMPONENT_PX pixels
+    # is a texture artifact, reflection fragment, or segmentation noise.
+    M_filtered = filter_small_components(M_opened)
 
     # --- Final Gaussian feathering ---
     k = int(smooth_sigma * 6 + 1) | 1
-    M_smooth = cv2.GaussianBlur(M_material, (k, k), smooth_sigma)
+    M_smooth = cv2.GaussianBlur(M_filtered, (k, k), smooth_sigma)
 
-    # --- Noise floor (only removes near-zero halo pixels) ---
+    # --- Noise floor ---
     M_smooth[M_smooth < noise_threshold] = 0.0
     M_final = np.clip(M_smooth, 0.0, 1.0).astype(np.float32)
 
@@ -438,14 +581,17 @@ def material_aware_mask(
           f"coverage={(M_final > 0.3).mean()*100:.1f}%")
 
     debug = {
-        "W_texture":   W_tex,
-        "W_color":     W_col,
-        "W_gradient":  W_grad,
-        "W_material":  W_material,
-        "M_sam_raw":   sam_mask,
-        "M_after_mat": M_material,
-        "M_final":     M_final,
-        "wall_color":  wall_color_rgb,
+        "W_texture":       W_tex,
+        "W_color":         W_col,
+        "W_gradient":      W_grad,
+        "W_tile":          W_tile,
+        "W_reflect":       W_reflect,
+        "W_material_base": W_material,
+        "W_combined":      W_combined,
+        "M_sam_raw":       sam_mask,
+        "M_after_mat":     M_material,
+        "M_final":         M_final,
+        "wall_color":      wall_color_rgb,
     }
     return M_final, debug
 
