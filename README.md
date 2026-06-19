@@ -17,6 +17,7 @@ Built with OpenCV, NumPy, PyTorch, and torchvision.
 | 6. Wall color detection (K-Means) | ✅ Done | `color_detect.py` |
 | 7. Color layer generation | ✅ Done | `color_layer.py` |
 | 8. Final blending (Magic-Wall / PRISM) | ✅ Done | `blend.py` |
+| 9. Evaluation + testing framework | ✅ Done | `evaluate.py` |
 | 4. LAB wall recoloring | ✅ Done | `recolor.py` |
 | 5. Official color database | ✅ Done | `colors.py` + `colors_valspar.csv` |
 | 6. Post-processing + output | 🔜 Planned | — |
@@ -788,6 +789,78 @@ Output files:
 ```
 room_8001-1G_rgb_blend.jpg              ← full-resolution result
 room_8001-1G_rgb_blend_comparison.png   ← 4-panel figure
+```
+
+---
+
+## Stage 9 — Evaluation + Testing Framework (`evaluate.py`)
+
+Quantitatively measures the quality of the final recolored output O(x,y)
+against the original image I(x,y) and the mask M_final(x,y).
+
+### Metrics at a glance
+
+| Metric | Formula | What it catches |
+|---|---|---|
+| `edge_error` | `mean(|∇I − ∇O|)` | Halo artifacts, broken object edges |
+| `color_variance` | `Var(O | mask > τ)` | Blotchy / uneven wall recoloring |
+| `leakage` | `mean(|O−I| | mask ≈ 0)` | Colour bleed onto furniture |
+| `brightness_error` | `mean(|V_I − V_O|)` | Lighting / shadow preservation |
+| `mean_wall_change` | `mean(|O−I| | mask > τ)` | How strongly the wall changed |
+| `mean_outside_change` | same, outside wall | Mirror of leakage |
+| `change_ratio` | `Σ_wall / (Σ_total + ε)` | Fraction of change inside wall |
+| `score` | weighted aggregate | Single quality number 0–1 |
+
+### Composite score formula
+
+```
+Score = w1*(1-E_norm) + w2*(1-V_norm) + w3*(1-L_norm) + w4*(1-B_norm)
+
+Default weights:  edge=0.25  variance=0.20  leakage=0.25  brightness=0.30
+```
+
+Each raw metric is normalised by a "worst-case" reference before weighting.
+All parameters are exposed for optimisation loops.
+
+### Why mask-aware analysis is critical
+
+The blending formula `O = M*R + (1-M)*I` guarantees:
+- `M = 1` → pixel should be fully changed (test: `mean_wall_change` should be large)
+- `M = 0` → pixel should be identical to I (test: `leakage` should be ≈ 0)
+- `0 < M < 1` → smooth transition (test: `edge_error` should be low)
+
+Without mask-aware metrics you can't distinguish "good change inside wall"
+from "bad change outside wall" — both show up the same in a naive diff.
+
+### Qualitative thresholds
+
+| Score | Interpretation |
+|---|---|
+| ≥ 0.85 | Excellent |
+| ≥ 0.70 | Good |
+| ≥ 0.55 | Fair — check leakage and brightness |
+| < 0.55 | Poor — review mask thresholds or blend mode |
+
+### Public API
+
+```python
+from evaluate import EvaluationMetrics, print_report, visualize_evaluation
+
+evaluator = EvaluationMetrics()
+result    = evaluator.compute_all(original, output, final_mask)
+
+print_report(result, color_name="8001-1G Amethyst Ice")
+# result.as_dict()  — plain dict for JSON / logging
+```
+
+### Run it
+
+```bash
+python evaluate.py room.jpg 8001-1G
+python evaluate.py room.jpg 8001-1G --hsv
+# saves <stem>_<code>_evaluation.png — 6-panel figure:
+# original | recolored | difference heatmap
+# wall overlay | Sobel edges | edge artifact map
 ```
 
 ---
