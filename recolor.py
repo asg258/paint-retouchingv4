@@ -232,7 +232,7 @@ def run_pipeline(
                       slightly less precise edges.
     """
     from preprocess import preprocess_image
-    from segment_segformer import load_segformer, get_segformer_mask
+    from segment_mit import load_mit_model, get_wall_mask
 
     # Resolve the paint color — exact first, fuzzy fallback.
     color = get_color(color_query)
@@ -255,14 +255,13 @@ def run_pipeline(
     preprocessed = preprocess_image(str(image_path))
     print(f"[stage1] Shape: {preprocessed.shape}")
 
-    # Stage 2: SegFormer ADE20K — semantically correct wall segmentation.
-    # ADE20K class 0 = "wall" (painted drywall), explicitly trained to
+    # Stage 2: MIT CSAIL ADE20K ResNet18-Dilated wall segmentation.
+    # ADE20K class 0 = "wall" (painted drywall).  Explicitly trained to
     # distinguish wall from tile, floor, cabinets, and fixtures.
-    # DeepLab COCO background class is completely removed from this pipeline.
-    print("\n--- Stage 2: SegFormer ADE20K wall segmentation ---")
-    sfm_model, sfm_processor, sfm_device = load_segformer()
-    coarse_mask = get_segformer_mask(preprocessed, model=sfm_model,
-                                     processor=sfm_processor, device=sfm_device)
+    # Weights: http://sceneparsing.csail.mit.edu (no HuggingFace needed).
+    print("\n--- Stage 2: MIT CSAIL ADE20K wall segmentation ---")
+    mit_model, mit_device = load_mit_model()
+    coarse_mask = get_wall_mask(preprocessed, model=mit_model, device=mit_device)
 
     # Stage 3: SAM boundary refinement
     if use_sam:
@@ -276,7 +275,7 @@ def run_pipeline(
             print(f"[stage3] Refined mask range: [{refined_mask.min():.3f}, {refined_mask.max():.3f}]")
         except FileNotFoundError as e:
             print(f"[stage3] WARNING: {e}")
-            print("[stage3] Falling back to SegFormer mask (no SAM checkpoint).")
+            print("[stage3] Falling back to MIT CSAIL ADE20K mask (no SAM checkpoint).")
             refined_mask = coarse_mask
     else:
         print("\n--- Stage 3: Skipped (use_sam=False) ---")
