@@ -60,17 +60,38 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 # How many pixels to expand the object boundary outward.
-# This is the "tape width" — larger = safer but eats into wall coverage.
-# 10 px works well for typical 1–4 MP room photos.
-# Increase if you still see bleed; decrease if too much wall is excluded.
-DILATION_SIZE: int = 10
+# Reduced from 10 → 4: 10px was eating into narrow wall strips in bathrooms
+# and kitchens where walls and objects sit close together.  4px is still
+# enough to absorb sub-pixel aliasing and JPEG artefacts without fragmenting
+# large continuous wall planes.
+DILATION_SIZE: int = 4
 
 # Optional Gaussian blur applied to the dilated protection mask.
-# Softens the hard edge of the protection zone so the transition from
-# "protected" to "safe to recolor" is gradual rather than a sharp step.
-# Set to 0 to skip smoothing entirely.
-PROTECTION_SIGMA: float     = 2.0
-PROTECTION_KERNEL_SIZE: int = 15   # must be odd; ignored if sigma == 0
+PROTECTION_SIGMA: float     = 1.5
+PROTECTION_KERNEL_SIZE: int = 11   # must be odd; ignored if sigma == 0
+
+# Hard ceiling on the protection mask value.
+# Even on pure object pixels, M_protect never exceeds this value.
+# This prevents the combination M_final = M_wall * (1 - M_protect) from
+# driving M_final all the way to zero on pixels where the wall mask is
+# still confident.  0.75 = protection can suppress at most 75 % of the wall.
+MAX_PROTECTION: float = 0.75
+
+# Alpha for the combination formula (see apply_protection).
+# M_final = M_wall * (1 - alpha * M_protect)
+# 1.0 = full protection effect (old behaviour, too aggressive)
+# 0.5 = protection is scaled down to half — near-edge wall pixels survive
+PROTECTION_ALPHA: float = 0.55
+
+# Wall pixels above this confidence are "strong wall" — the protection mask
+# is not allowed to reduce them below STRONG_WALL_FLOOR.
+STRONG_WALL_THRESHOLD: float = 0.80
+STRONG_WALL_FLOOR:     float = 0.65
+
+# Small dilation applied to the WALL mask before combining with the protection
+# mask.  This closes holes and maintains connectivity across thin wall strips
+# before the protection mask can fragment them.
+WALL_EXPAND_SIZE: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -174,38 +195,96 @@ def create_object_protection_mask(
         k = _validated_kernel_size(kernel_size)
         obj_mask = cv2.GaussianBlur(obj_mask, (k, k), smoothing_sigma)
 
-    protection_mask = np.clip(obj_mask, 0.0, 1.0).astype(np.float32)
+    # Cap at MAX_PROTECTION so even on pure object pixels the mask never
+    # reaches 1.0.  This prevents the combination formula from zeroing out
+    # pixels where the wall mask is still moderately confident.
+    protection_mask = np.clip(obj_mask, 0.0, MAX_PROTECTION).astype(np.float32)
 
     return protection_mask
 
 
 def apply_protection(
-    wall_mask: np.ndarray,
-    protection_mask: np.ndarray,
+    wall_mask:        np.ndarray,
+    protection_mask:  np.ndarray,
+    alpha:            float = PROTECTION_ALPHA,
+    strong_threshold: float = STRONG_WALL_THRESHOLD,
+    strong_floor:     float = STRONG_WALL_FLOOR,
+    wall_expand_size: int   = WALL_EXPAND_SIZE,
 ) -> np.ndarray:
     """
     Combine the wall mask and the protection mask into the final blend mask.
 
-    Formula:
-        M_final(x,y) = M_wall(x,y) * (1 - M_protect(x,y))
+    Uses a balanced formula that protects object edges WITHOUT fragmenting
+    large continuous wall regions.  Five constraints are applied in order:
 
-    This zeroes out the wall mask wherever the protection zone is active,
-    leaving a mask that is:
-      - 0 everywhere outside the wall
-      - 0 everywhere near or inside detected objects
-      - soft gradient 0→max_wall_value at safe wall edges
+    1. Light wall dilation — closes holes in the wall mask before protection
+       can fragment it.  A 3px expand maintains connectivity across thin
+       wall strips (narrow corridors, bathroom walls between objects).
+
+    2. Alpha-scaled combination:
+           M_final = M_wall * (1 - alpha * M_protect)
+       alpha < 1 means protection is scaled down; even near objects the wall
+       mask retains (1 - alpha * 1.0) = 1 - alpha of its value.
+
+    3. Strong-wall floor — pixels where M_wall > strong_threshold are highly
+       confident wall.  Protection is not allowed to suppress them below
+       strong_floor, preserving large contiguous wall planes.
+
+    4. The original protection_mask should already be capped at MAX_PROTECTION
+       by create_object_protection_mask() — this prevents any single pixel
+       from being driven all the way to zero.
+
+    Formula summary:
+        M_wall_exp  = dilate(M_wall, 3px)
+        M_candidate = M_wall_exp * (1 - alpha * M_protect)
+        M_final     = max(M_candidate, M_wall_exp * strong_floor)  where M_wall > threshold
+        M_final     = M_candidate                                   elsewhere
 
     Args:
-        wall_mask:        (H, W) float32 from Stage 4.
+        wall_mask:        (H, W) float32 from Stage 4 (after mask processing).
         protection_mask:  (H, W) float32 from create_object_protection_mask().
+        alpha:            Scales down the protection influence (0=no protection, 1=full).
+        strong_threshold: Wall pixels above this get the strong-wall floor guarantee.
+        strong_floor:     Minimum M_final fraction for strong wall pixels.
+        wall_expand_size: Pixels to dilate the wall mask before combining.
 
     Returns:
         final_mask: (H, W) float32, values in [0, 1].
+
+      - 0 everywhere outside the wall
+      - reduced near objects (by alpha * M_protect)
+      - floored at strong_floor * M_wall for high-confidence wall pixels
     """
-    return np.clip(
-        wall_mask.astype(np.float32) * (1.0 - protection_mask.astype(np.float32)),
-        0.0, 1.0,
-    )
+    M_w = wall_mask.astype(np.float32)
+    M_p = protection_mask.astype(np.float32)
+
+    # Step 1 — lightly dilate the wall mask to close holes before protection
+    # can fragment it.  Small kernel only — we don't want to expand walls.
+    if wall_expand_size > 0:
+        k_expand = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (wall_expand_size * 2 + 1, wall_expand_size * 2 + 1),
+        )
+        M_w = cv2.dilate(M_w, k_expand, iterations=1)
+        M_w = np.clip(M_w, 0.0, 1.0)
+
+    # Step 2 — alpha-scaled combination:
+    #   M_candidate = M_wall * (1 - alpha * M_protect)
+    # At furniture edges (M_protect ≈ 0.75, alpha=0.55):
+    #   M_candidate = M_wall * (1 - 0.41) = M_wall * 0.59   → still visible
+    # At clear object centres (M_protect = 0.75 max, alpha=0.55):
+    #   M_candidate = M_wall * 0.59 — protection is real but not annihilating
+    M_candidate = M_w * (1.0 - alpha * M_p)
+
+    # Step 3 — strong-wall floor guarantee.
+    # Pixels where the wall mask is very confident (> strong_threshold) are
+    # on the main wall plane, not at a boundary. Protection should not reduce
+    # them below strong_floor * M_wall — this preserves large continuous areas.
+    strong = M_w > strong_threshold
+    M_floor = M_w * strong_floor
+    M_final = np.where(strong, np.maximum(M_candidate, M_floor), M_candidate)
+
+    return np.clip(M_final, 0.0, 1.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

@@ -44,7 +44,8 @@ SAT_MIN_WALL: int = 45
 
 # Value (brightness) thresholds for background detection.
 # Very dark pixels are furniture/cabinets; very bright are blown highlights.
-LUMA_DARK_THRESH:  int = 75    # V < this  → definitely furniture
+LUMA_DARK_THRESH:  int = 55    # V < this  → definitely furniture (lowered from 75 to avoid
+                               # catching wall shadows which can score V ≈ 60-80)
 LUMA_BRIGHT_THRESH: int = 230  # V > this  → blown highlight / window
 
 # How many background prompt points to pull from each color-analysis region.
@@ -415,6 +416,13 @@ def luminance_protection_mask(
     # Smooth edges so the transition isn't a hard step.
     k = 15
     dark_smooth = cv2.GaussianBlur(dark, (k, k), blend_sigma)
+
+    # Cap the luminance-based signal before merging.
+    # We don't want wall shadows (which can have low V) to be mistakenly
+    # treated as "fully protected furniture".  Capping at 0.70 means the
+    # luminance signal can boost protection but cannot drive it to 1.0 on
+    # its own — it still needs the wall mask to be low for M_final to be low.
+    dark_smooth = np.clip(dark_smooth, 0.0, 0.70)
 
     # Take element-wise max: existing protection OR luminance-based protection.
     boosted = np.maximum(existing_protect.astype(np.float32), dark_smooth)
