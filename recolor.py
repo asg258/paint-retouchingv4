@@ -35,13 +35,26 @@ from colors import get_color, search_colors, ColorEntry
 # Default recoloring parameters
 # ---------------------------------------------------------------------------
 
-# How strongly to apply the new color.
-# 1.0 = full replacement, 0.0 = no change. Useful range: 0.7–1.0.
-COLOR_BLEND_STRENGTH: float = 0.90
+# Full A/B replacement — set to 1.0 so the wall actually becomes the target
+# color rather than a faint tint. Lower only if you want a subtle wash effect.
+COLOR_BLEND_STRENGTH: float = 1.0
 
 # Pixels with mask value below this threshold are not recolored at all.
 # This protects furniture and other objects that crept into the wall mask.
 MASK_THRESHOLD: float = 0.25
+
+# Minimum LAB A or B shift from neutral (128 in cv2 encoding).
+# Light neutral walls often have A and B values very close to 128.
+# If the target color is also near-neutral, the visual change is imperceptible.
+# This parameter guarantees a minimum push away from gray so the color is always
+# visible — without forcing a garish result. 8 LAB units is subtle but noticeable.
+MIN_COLOR_SHIFT: float = 8.0
+
+# After recoloring, scale A and B in the wall region slightly away from neutral.
+# 1.0 = no boost.  1.15 = 15% more vivid.  Good range: 1.0–1.20.
+# This helps test colours look "as painted" rather than washed-out, which
+# matches how paint looks on a fresh dry coat vs. an image screenshot.
+SATURATION_BOOST: float = 1.12
 
 
 # ---------------------------------------------------------------------------
@@ -54,70 +67,95 @@ def recolor_walls(
     color: ColorEntry,
     blend_strength: float = COLOR_BLEND_STRENGTH,
     mask_threshold: float = MASK_THRESHOLD,
+    min_color_shift: float = MIN_COLOR_SHIFT,
+    saturation_boost: float = SATURATION_BOOST,
 ) -> np.ndarray:
     """
     Repaint wall pixels to the target paint color while preserving lighting.
 
     The approach:
       1. Convert image and target color to LAB.
-      2. For every pixel, compute how much to shift A and B toward the target.
-         The shift weight = mask_value x blend_strength.
-         Pixels deep in the wall get the full shift; edge pixels get a
-         proportionally smaller shift, creating a smooth feathered boundary.
-      3. L channel is untouched — shadows and highlights are preserved.
-      4. Convert back to RGB.
+      2. Enforce a minimum A/B shift from neutral so the color is always
+         visible even on very light or near-neutral walls.
+      3. For every pixel, blend A and B toward the target, weighted by the
+         mask probability times blend_strength (smooth feathered edge).
+      4. L channel is untouched — shadows and highlights are preserved.
+      5. Apply a mild saturation boost inside the wall region so the result
+         looks like a freshly-painted coat rather than a faint overlay.
+      6. Convert back to RGB.
 
     Args:
-        image_rgb:      (H, W, 3) uint8 RGB image (Stage 1 output).
-        mask:           (H, W) float32 wall probability mask (Stage 3 output).
-        color:          ColorEntry from the Valspar database (colors.py).
-        blend_strength: How fully to apply the new color (0-1).
-        mask_threshold: Mask values below this are left unchanged.
+        image_rgb:        (H, W, 3) uint8 RGB image (Stage 1 output).
+        mask:             (H, W) float32 wall probability mask (Stage 3 output).
+        color:            ColorEntry from the Valspar database (colors.py).
+        blend_strength:   How fully to replace A/B channels (0-1). 1.0 = full.
+        mask_threshold:   Mask values below this are not recolored.
+        min_color_shift:  Minimum LAB A or B deviation from neutral (128).
+                          Ensures the color change is always visible.
+        saturation_boost: Scale factor applied to A/B in the wall region
+                          after blending. > 1.0 makes the color more vivid.
 
     Returns:
         recolored: (H, W, 3) uint8 RGB image with walls repainted.
     """
     target_rgb = color.rgb
 
-    # --- Convert image to LAB ---
-    # cv2 expects BGR input for COLOR_BGR2LAB, so convert accordingly.
+    # Convert image to float LAB for precise arithmetic.
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    lab_image  = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab        = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    # --- Convert target paint color to LAB ---
-    # Build a 1x1 pixel in the target color, convert it to LAB,
-    # and read off the A and B values we want to push the wall toward.
-    target_pixel_bgr = np.array(
-        [[[target_rgb[2], target_rgb[1], target_rgb[0]]]], dtype=np.uint8
-    )
-    target_lab = cv2.cvtColor(target_pixel_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    target_a = float(target_lab[0, 0, 1])
-    target_b = float(target_lab[0, 0, 2])
+    # Convert the target paint color to LAB.
+    target_bgr = np.array([[[target_rgb[2], target_rgb[1], target_rgb[0]]]], dtype=np.uint8)
+    target_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    target_a   = float(target_lab[0, 0, 1])
+    target_b   = float(target_lab[0, 0, 2])
 
-    print(f"[recolor] Color: {color.code}  '{color.name}'  RGB{target_rgb}  #{color.hex}")
+    # --- Enforce minimum color shift ---
+    # In cv2 LAB encoding, neutral gray sits at A=128, B=128.
+    # Very light or near-neutral walls can have A/B close to 128 already,
+    # so a near-neutral target color would produce an invisible change.
+    # We push the target A and B at least min_color_shift units away from 128
+    # so there is always a perceptible difference on-screen.
+    neutral = 128.0
+    def _enforce_min_shift(val: float) -> float:
+        offset = val - neutral
+        if abs(offset) < min_color_shift:
+            # Keep the direction (sign) but guarantee the minimum magnitude.
+            offset = min_color_shift if offset >= 0 else -min_color_shift
+        return neutral + offset
+
+    target_a = _enforce_min_shift(target_a)
+    target_b = _enforce_min_shift(target_b)
+
+    print(f"[recolor] Color : {color.code}  '{color.name}'  RGB{target_rgb}  #{color.hex}")
     print(f"[recolor] Family: {color.family}  LRV: {color.lrv}")
-    print(f"[recolor] Target LAB - A: {target_a:.1f}  B: {target_b:.1f}")
+    print(f"[recolor] Target LAB (after min-shift) - A: {target_a:.1f}  B: {target_b:.1f}")
 
-    # --- Build a per-pixel blend weight ---
-    # weight = 0 outside the wall (mask below threshold)
-    # weight smoothly rises with mask confidence, capped at blend_strength
+    # --- Build per-pixel blend weight ---
+    # weight = 0 outside the wall, rises smoothly with mask confidence.
     weight = np.clip(mask, 0.0, 1.0)
     weight[weight < mask_threshold] = 0.0
-    weight = weight * blend_strength    # (H, W), values in [0, blend_strength]
+    weight = weight * blend_strength    # shape (H, W), values in [0, blend_strength]
 
-    # Expand to (H, W, 1) for broadcasting across A and B channels.
-    w = weight[:, :, np.newaxis]
+    # --- Replace A and B, leave L untouched ---
+    lab_out = lab.copy()
+    lab_out[:, :, 1] = lab[:, :, 1] * (1.0 - weight) + target_a * weight
+    lab_out[:, :, 2] = lab[:, :, 2] * (1.0 - weight) + target_b * weight
 
-    # --- Shift A and B channels toward target, leave L alone ---
-    lab_shifted = lab_image.copy()
-    lab_shifted[:, :, 1] = lab_image[:, :, 1] * (1.0 - weight) + target_a * weight
-    lab_shifted[:, :, 2] = lab_image[:, :, 2] * (1.0 - weight) + target_b * weight
+    # --- Saturation boost inside the wall region ---
+    # Scale A and B away from neutral (128) by saturation_boost in the wall
+    # region only. This makes the color read as a true painted coat rather
+    # than a translucent wash — particularly important for light target colors.
+    if saturation_boost != 1.0:
+        wall_pixels = weight > 0   # boolean mask (H, W)
+        for ch in [1, 2]:
+            ch_f  = lab_out[:, :, ch]
+            boosted = (ch_f - neutral) * saturation_boost + neutral
+            lab_out[:, :, ch] = np.where(wall_pixels, boosted, ch_f)
 
-    # Clip back to valid uint8 range before converting.
-    lab_shifted = np.clip(lab_shifted, 0, 255).astype(np.uint8)
+    lab_out = np.clip(lab_out, 0, 255).astype(np.uint8)
 
-    # --- Convert back to RGB ---
-    recolored_bgr = cv2.cvtColor(lab_shifted, cv2.COLOR_LAB2BGR)
+    recolored_bgr = cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
     recolored_rgb = cv2.cvtColor(recolored_bgr, cv2.COLOR_BGR2RGB)
 
     return recolored_rgb

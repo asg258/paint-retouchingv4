@@ -79,20 +79,29 @@ SAM_CHECKPOINT: str = "sam_vit_b_01ec64.pth"
 SAM_MODEL_TYPE: str = "vit_b"
 
 # Pixels with P(wall) above this are treated as confident foreground.
-# Lower this if SAM generates too few foreground prompts.
-FG_THRESHOLD: float = 0.70
+# Raised to 0.80 so only truly high-confidence wall pixels become prompts.
+# This prevents ambiguous surfaces (wood panels, trim) from polluting the
+# foreground signal and reduces over-segmentation.
+FG_THRESHOLD: float = 0.80
 
 # Pixels with P(wall) below this are treated as confident background.
-BG_THRESHOLD: float = 0.30
+# Lowered to 0.20 — tighter band means only clearly-non-wall pixels are used.
+# The wider gap between FG and BG thresholds (0.80 vs 0.20) leaves the
+# uncertain middle zone unprompted, letting SAM decide those boundaries itself.
+BG_THRESHOLD: float = 0.20
 
-# How many prompt points to sample from each region.
-# More points = more context for SAM, but diminishing returns past ~10.
-MAX_FG_POINTS: int = 8
-MAX_BG_POINTS: int = 4
+# Total prompt budget per category.
+# More points = richer spatial context for SAM.
+# These are distributed evenly across spatial zones (see N_ZONES) rather than
+# sampled globally, so the points actually cover the full image instead of
+# clustering wherever DeepLab is most confident.
+MAX_FG_POINTS: int = 30
+MAX_BG_POINTS: int = 10
 
-# Spacing (in pixels) for the grid used to sample prompt points.
-# Smaller = denser sampling (more representative), larger = faster.
-POINT_GRID_SPACING: int = 30
+# Divide the image into an N_ZONES x N_ZONES grid before sampling.
+# Each zone contributes its fair share of FG and BG points, guaranteeing
+# spatial spread even if the wall only covers one corner of the image.
+N_ZONES: int = 4
 
 
 # ---------------------------------------------------------------------------
@@ -158,103 +167,115 @@ def generate_sam_prompts(
     bg_threshold: float = BG_THRESHOLD,
     max_fg_points: int = MAX_FG_POINTS,
     max_bg_points: int = MAX_BG_POINTS,
-    grid_spacing: int = POINT_GRID_SPACING,
+    n_zones: int = N_ZONES,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Sample foreground and background coordinate prompts from the coarse mask.
+    Sample spatially-spread foreground and background prompts from the mask.
 
     What are prompts in SAM?
-    SAM is a promptable model — instead of classifying every pixel like DeepLab,
-    it responds to hints about WHERE the object of interest is. A prompt is
-    simply a 2D coordinate plus a label:
+    SAM is a promptable model — it doesn't classify every pixel like DeepLab.
+    Instead, you give it coordinate hints and labels:
         label = 1  → "this point is INSIDE the wall"
         label = 0  → "this point is OUTSIDE the wall"
+    SAM draws the sharpest boundary it can find that separates the two groups.
 
-    SAM uses these sparse hints together with the image embedding to decide
-    exactly where the boundary should be drawn.
+    Why higher thresholds (0.80 / 0.20)?
+    Wood panels and decorative surfaces score in the 0.4–0.7 range — they are
+    ambiguous to DeepLab. By only sampling points where DeepLab is truly
+    confident (> 0.80 for wall, < 0.20 for non-wall), we avoid giving SAM
+    misleading hints about ambiguous regions and let it resolve those areas
+    from visual evidence instead of noisy prompts.
 
-    Why derive prompts from the DeepLab mask?
-    We already know roughly where the wall is — DeepLab told us. We just don't
-    trust its edges. So we trust its high-confidence interior pixels (P > 0.7)
-    as reliable "this is wall" evidence, and its high-confidence exterior pixels
-    (P < 0.3) as reliable "this is not wall" evidence. We sample a handful of
-    each to give SAM enough context.
-
-    Sampling strategy — sparse grid:
-    Rather than picking random pixels (which might cluster), we evaluate every
-    point on a regular grid and then keep only the ones that fall in confident
-    regions. This gives spatially spread-out prompts that cover the object area.
+    Why zone-based spatial sampling?
+    The old grid approach sampled from wherever the mask was densest, which
+    in practice means the horizontal center of the room where the wall is most
+    clearly visible. That left corners, edges, and upper portions under-prompted.
+    Zone-based sampling divides the image into an n_zones x n_zones grid and
+    allocates a prompt budget to each cell. Every part of the image gets
+    representation, so SAM understands the wall boundary all the way around —
+    not just in the middle.
 
     Args:
         coarse_mask:   (H, W) float32 probability mask from DeepLab.
-        fg_threshold:  Confidence above which a pixel is a foreground prompt.
-        bg_threshold:  Confidence below which a pixel is a background prompt.
-        max_fg_points: Maximum number of foreground prompts to return.
-        max_bg_points: Maximum number of background prompts to return.
-        grid_spacing:  Distance between grid sample points in pixels.
+        fg_threshold:  Min confidence to treat a pixel as a foreground prompt.
+        bg_threshold:  Max confidence to treat a pixel as a background prompt.
+        max_fg_points: Total foreground prompt budget (spread across zones).
+        max_bg_points: Total background prompt budget (spread across zones).
+        n_zones:       Number of grid divisions per axis (n_zones x n_zones).
 
     Returns:
-        point_coords: (N, 2) array of (x, y) prompt coordinates.
-        point_labels: (N,)   array of 1 (foreground) or 0 (background).
+        point_coords: (N, 2) float array of (x, y) prompt coordinates.
+        point_labels: (N,)   int array of 1 (foreground) or 0 (background).
 
     Raises:
-        ValueError: if no foreground prompts can be found (mask too dim).
+        ValueError: if no foreground prompts can be found.
     """
     h, w = coarse_mask.shape
+    rng = np.random.default_rng(seed=42)   # fixed seed for reproducibility
 
-    # Build a sparse grid of candidate pixel locations.
-    ys = np.arange(0, h, grid_spacing)
-    xs = np.arange(0, w, grid_spacing)
-    grid_x, grid_y = np.meshgrid(xs, ys)
-    grid_x = grid_x.ravel()
-    grid_y = grid_y.ravel()
+    # How many points each zone contributes from its local budget.
+    # Integer division — any remainder is silently dropped (acceptable rounding).
+    n_cells = n_zones * n_zones
+    fg_per_zone = max(1, max_fg_points // n_cells)
+    bg_per_zone = max(1, max_bg_points // n_cells)
 
-    # Read the mask value at each grid point.
-    grid_vals = coarse_mask[grid_y, grid_x]
+    zone_h = max(1, h // n_zones)
+    zone_w = max(1, w // n_zones)
 
-    # Foreground candidates: high-confidence wall pixels.
-    fg_mask = grid_vals >= fg_threshold
-    fg_xs, fg_ys = grid_x[fg_mask], grid_y[fg_mask]
+    fg_list: list[tuple[int, int]] = []   # (x, y) pairs
+    bg_list: list[tuple[int, int]] = []
 
-    # Background candidates: high-confidence non-wall pixels.
-    bg_mask = grid_vals <= bg_threshold
-    bg_xs, bg_ys = grid_x[bg_mask], grid_y[bg_mask]
+    for zi in range(n_zones):
+        for zj in range(n_zones):
+            # Pixel bounds for this zone — clamp to image edges.
+            y0, y1 = zi * zone_h, min(h, (zi + 1) * zone_h)
+            x0, x1 = zj * zone_w, min(w, (zj + 1) * zone_w)
 
-    if fg_xs.size == 0:
+            zone = coarse_mask[y0:y1, x0:x1]
+
+            # --- Foreground pixels in this zone (high-confidence wall) ---
+            fy, fx = np.where(zone >= fg_threshold)
+            if len(fy) > 0:
+                k = min(fg_per_zone, len(fy))
+                chosen = rng.choice(len(fy), k, replace=False)
+                for idx in chosen:
+                    fg_list.append((int(x0 + fx[idx]), int(y0 + fy[idx])))
+
+            # --- Background pixels in this zone (high-confidence non-wall) ---
+            by, bx = np.where(zone <= bg_threshold)
+            if len(by) > 0:
+                k = min(bg_per_zone, len(by))
+                chosen = rng.choice(len(by), k, replace=False)
+                for idx in chosen:
+                    bg_list.append((int(x0 + bx[idx]), int(y0 + by[idx])))
+
+    if not fg_list:
         raise ValueError(
-            f"No foreground prompt points found (no pixels with mask > {fg_threshold}). "
-            "Try lowering FG_THRESHOLD or check that the coarse mask is not empty."
+            f"No foreground prompts found (no pixels with mask > {fg_threshold} "
+            f"in any of the {n_zones}x{n_zones} zones). "
+            "Try lowering FG_THRESHOLD."
         )
 
-    # Subsample to the requested maximum counts.
-    fg_idx = _subsample_indices(fg_xs.size, max_fg_points)
-    bg_idx = _subsample_indices(bg_xs.size, max_bg_points)
+    fg_arr    = np.array(fg_list, dtype=np.float32)      # (n_fg, 2)
+    fg_labels = np.ones(len(fg_arr), dtype=int)
 
-    fg_coords = np.stack([fg_xs[fg_idx], fg_ys[fg_idx]], axis=1)   # (n_fg, 2)
-    fg_labels = np.ones(len(fg_idx), dtype=int)
-
-    if bg_xs.size > 0:
-        bg_coords = np.stack([bg_xs[bg_idx], bg_ys[bg_idx]], axis=1)
-        bg_labels = np.zeros(len(bg_idx), dtype=int)
-        point_coords = np.concatenate([fg_coords, bg_coords], axis=0)
+    if bg_list:
+        bg_arr    = np.array(bg_list, dtype=np.float32)  # (n_bg, 2)
+        bg_labels = np.zeros(len(bg_arr), dtype=int)
+        point_coords = np.concatenate([fg_arr, bg_arr], axis=0)
         point_labels = np.concatenate([fg_labels, bg_labels], axis=0)
     else:
-        # No confident background found — proceed with foreground only.
-        point_coords = fg_coords
+        point_coords = fg_arr
         point_labels = fg_labels
 
+    n_fg = int(fg_labels.sum())
+    n_bg = int((point_labels == 0).sum())
     print(
-        f"[refine] Prompts — {fg_labels.sum()} foreground, "
-        f"{(point_labels == 0).sum()} background"
+        f"[refine] Prompts: {n_fg} foreground + {n_bg} background "
+        f"across {n_zones}x{n_zones} zones "
+        f"(thresholds: fg>{fg_threshold}, bg<{bg_threshold})"
     )
     return point_coords, point_labels
-
-
-def _subsample_indices(total: int, max_count: int) -> np.ndarray:
-    """Return up to max_count evenly-spaced indices from [0, total)."""
-    if total <= max_count:
-        return np.arange(total)
-    return np.linspace(0, total - 1, max_count, dtype=int)
 
 
 # ---------------------------------------------------------------------------
