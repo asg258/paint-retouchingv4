@@ -1,7 +1,7 @@
 # Wall Recoloring Pipeline
 
 A modular Python pipeline for intelligently recoloring walls in interior photos.
-Built with OpenCV and NumPy, with PyTorch coming in for the segmentation stage.
+Built with OpenCV, NumPy, PyTorch, and torchvision.
 
 ---
 
@@ -10,7 +10,7 @@ Built with OpenCV and NumPy, with PyTorch coming in for the segmentation stage.
 | Stage | Status | File |
 |-------|--------|------|
 | 1. Image loading + LAB preprocessing | ✅ Done | `preprocess.py` |
-| 2. Wall segmentation | 🔜 Planned | — |
+| 2. DeepLabV3 semantic segmentation | ✅ Done | `segment.py` |
 | 3. Color transfer / recoloring | 🔜 Planned | — |
 | 4. Post-processing + output | 🔜 Planned | — |
 
@@ -74,13 +74,99 @@ rgb_array = preprocess_image("path/to/room.jpg")
 
 ---
 
+## Stage 2 — Semantic Segmentation (`segment.py`)
+
+Takes the preprocessed RGB image from Stage 1 and produces a **dense probability
+mask** — a float array of the same spatial size where each value is
+`P(wall | pixel) ∈ [0, 1]`.
+
+### How it works
+
+```
+Preprocessed RGB (H, W, 3) uint8
+            │
+            ▼
+    Resize shorter edge to 512 px (configurable)
+    Normalise with ImageNet mean/std
+    Add batch dimension → (1, 3, H', W') tensor
+            │
+            ▼
+    DeepLabV3+ ResNet101 forward pass
+    (ResNet101 extracts multi-scale features via dilated convolutions;
+     the ASPP head aggregates them into per-pixel class scores)
+            │
+            ▼
+    Raw logits  (1, num_classes, H', W')
+    — one unbounded score per class per pixel
+            │
+            ▼
+    Softmax over class dimension
+    P(k | x) = exp(z_k) / Σ_j exp(z_j)
+    — converts scores to a probability distribution at each pixel
+            │
+            ▼
+    Extract wall-proxy channel → (H', W')
+            │
+            ▼
+    Bilinear upsample → original (H, W)
+            │
+            ▼
+    float32 NumPy array, values ∈ [0, 1]
+```
+
+### The wall class problem
+
+The default torchvision DeepLabV3 was trained on **COCO with Pascal VOC labels
+(21 classes)** — there is no "wall" class. We use **class index 0 (background)**
+as a proxy.  In interior photos the background class captures walls, ceilings,
+and floors — the regions the model cannot assign to any named foreground object.
+
+| Model | Has explicit wall class? | Wall index | Notes |
+|---|---|---|---|
+| DeepLabV3 (COCO VOC-21, **this file**) | No | 0 (background proxy) | Good enough for first-pass masks |
+| DeepLabV3 (ADE20K) | Yes | 1 | Drop-in swap, just change `WALL_CLASS_INDEX` |
+| DeepLabV3 (COCO-Stuff 182) | Yes | varies | Best coverage, larger model |
+
+### Why a soft mask, not a binary mask?
+
+A hard 0/1 mask throws away the model's confidence.  Pixels near the boundary
+between a wall and a sofa might score P(wall)=0.55 — forcing that to 1 discards
+useful uncertainty information.  Downstream blending stages can use the
+continuous probability to produce smooth, natural transitions.
+
+### Tunable parameters
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| `WALL_CLASS_INDEX` | `0` | Which class to extract after softmax |
+| `INFERENCE_SIZE` | `512` | Shorter-edge resize before inference. `None` = full resolution. |
+
+### Public API
+
+```python
+from segment import load_model, get_deeplab_mask
+
+model, device = load_model()   # load once, reuse for every image
+
+mask = get_deeplab_mask(preprocessed_rgb, model=model, device=device)
+# returns: np.ndarray, shape (H, W), dtype float32, values in [0, 1]
+```
+
+### Debug visualisation
+
+```bash
+python segment.py room.jpg
+# opens a 3-panel figure: original | heatmap | overlay
+# also saves <image_stem>_wall_mask.png
+```
+
+---
+
 ## Setup
 
 ```bash
-pip install opencv-python numpy
+pip install opencv-python numpy torch torchvision matplotlib pillow
 ```
-
-PyTorch is not needed yet (required for Stage 2 segmentation).
 
 ---
 
