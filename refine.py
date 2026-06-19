@@ -91,12 +91,11 @@ FG_THRESHOLD: float = 0.80
 BG_THRESHOLD: float = 0.20
 
 # Total prompt budget per category.
-# More points = richer spatial context for SAM.
-# These are distributed evenly across spatial zones (see N_ZONES) rather than
-# sampled globally, so the points actually cover the full image instead of
-# clustering wherever DeepLab is most confident.
+# FG budget kept high for full wall coverage across all zones.
+# BG budget reduced to 4 — enough to hint at object locations without
+# aggressively suppressing wall regions near ambiguous boundaries.
 MAX_FG_POINTS: int = 30
-MAX_BG_POINTS: int = 10
+MAX_BG_POINTS: int = 4
 
 # Divide the image into an N_ZONES x N_ZONES grid before sampling.
 # Each zone contributes its fair share of FG and BG points, guaranteeing
@@ -421,35 +420,36 @@ def refine_mask_with_sam(
     # predictor in — it caches the embedding automatically.
     predictor.set_image(image)   # expects uint8 RGB
 
-    # First, color-refine the coarse mask so SAM sees a cleaner starting point.
-    from wall_enhance import (
-        compute_wall_color_stats,
-        refine_mask_by_color,
-        color_based_background_points,
-    )
-    wall_stats    = compute_wall_color_stats(image, coarse_mask)
-    refined_input = refine_mask_by_color(image, coarse_mask, wall_stats)
+    # Stage 2.5 (color-based mask refinement) REMOVED.
+    # It was compounding suppression with erosion and protection, causing
+    # severe mask fragmentation. SAM is fed the raw DeepLab mask directly.
 
-    # Derive prompt points; pass image for color-based BG fallback.
+    # Generate prompts from the unmodified coarse mask.
+    # image is still passed for the color-based BG fallback when
+    # the mask yields zero background points (e.g. bathrooms).
     point_coords, point_labels = generate_sam_prompts(
-        refined_input, image=image, wall_stats=wall_stats
+        coarse_mask, image=image
     )
 
-    # Run SAM — returns 3 candidate masks, their quality scores, and the
-    # logits (we ignore logits here; they're useful for chained predictions).
+    # Run SAM — returns 3 candidate masks, their quality scores, and logits.
     sam_masks, sam_scores, _ = predictor.predict(
         point_coords=point_coords,
         point_labels=point_labels,
-        multimask_output=True,   # produce 3 candidates, pick the best one
+        multimask_output=True,
     )
-    # sam_masks:  (3, H, W) bool
-    # sam_scores: (3,) float
 
     # Pick the candidate that best overlaps with the DeepLab mask.
     best_mask = _select_best_mask(sam_masks, sam_scores, coarse_mask)
 
     # Blend SAM's crisp binary boundary with DeepLab's soft probabilities.
     refined_mask = _combine_masks(best_mask, coarse_mask)
+
+    # Small dilation to close holes and restore continuity in large wall planes
+    # that SAM may have fragmented into islands.  2px is subtle — just enough
+    # to reconnect regions separated by thin gaps, not enough to leak onto objects.
+    continuity_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    refined_mask = cv2.dilate(refined_mask, continuity_kernel, iterations=1)
+    refined_mask = np.clip(refined_mask, 0.0, 1.0).astype(np.float32)
 
     return refined_mask   # float32, (H, W), values in [0, 1]
 

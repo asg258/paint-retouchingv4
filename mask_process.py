@@ -42,23 +42,18 @@ from pathlib import Path
 # Tunable parameters
 # ---------------------------------------------------------------------------
 
-# Gaussian blur — controls how wide the soft edge transition zone is.
-# Larger sigma = wider feather = softer boundary but more color bleed risk.
-# Larger kernel = more thorough smoothing (must be odd number).
-# Good starting values for a 1080p-ish image: sigma=3, kernel=21.
-GAUSSIAN_SIGMA: float      = 3.0
-GAUSSIAN_KERNEL_SIZE: int  = 21   # must be odd
+# Gaussian blur — softens hard SAM edges into a smooth probability gradient.
+# sigma=2 is gentle: wide enough to remove jagged contours, narrow enough
+# to keep large wall regions intact without pulling them inward.
+GAUSSIAN_SIGMA: float      = 2.0
+GAUSSIAN_KERNEL_SIZE: int  = 15   # must be odd
 
-# Erosion — shrinks the mask inward by this many pixels on every edge.
-# This creates a safety margin so boundary pixels (shared between wall and
-# adjacent objects) are zeroed out before blending. A little goes a long way:
-# 3–8 pixels is usually enough without visibly shrinking the wall coverage.
-EROSION_SIZE: int = 5
+# Erosion REMOVED. It was compounding with Stage 5 protection to fragment
+# large wall planes into disconnected islands. Edge safety is now handled
+# solely by the lightweight erosion in Stage 5 (apply_protection).
 
-# Noise threshold — mask values below this are forced to 0 after smoothing.
-# Removes faint probability halos and isolated low-confidence pixels that
-# Gaussian blur spreads outward from the boundary.
-NOISE_THRESHOLD: float = 0.05
+# Noise threshold — removes truly isolated single-pixel noise after blurring.
+NOISE_THRESHOLD: float = 0.04
 
 
 # ---------------------------------------------------------------------------
@@ -67,99 +62,53 @@ NOISE_THRESHOLD: float = 0.05
 
 def process_mask(
     mask: np.ndarray,
-    gaussian_sigma: float     = GAUSSIAN_SIGMA,
-    kernel_size: int          = GAUSSIAN_KERNEL_SIZE,
-    erosion_size: int         = EROSION_SIZE,
-    noise_threshold: float    = NOISE_THRESHOLD,
+    gaussian_sigma: float  = GAUSSIAN_SIGMA,
+    kernel_size: int       = GAUSSIAN_KERNEL_SIZE,
+    noise_threshold: float = NOISE_THRESHOLD,
 ) -> np.ndarray:
     """
-    Clean and soften the SAM-refined wall mask before blending.
+    Soften the SAM-refined wall mask before blending.
 
-    Pipeline:
-        1. Erode  — shrink mask inward to remove boundary-pixel contamination
-        2. Gaussian blur — spread hard edges into a smooth probability gradient
-        3. Threshold — zero out residual noise from the blur spread
+    Simplified pipeline (erosion removed):
+        1. Gaussian blur — turn hard SAM edges into a smooth 0→1 gradient
+        2. Threshold    — remove isolated noise pixels after blur
 
-    Why in this order?
-    Eroding first removes the contaminated edge pixels BEFORE the blur can
-    spread their color into the interior. If you blur first, the eroded
-    edge would include already-blurred values and you'd lose the soft gradient.
+    Erosion was removed because it was compounding with the protection mask
+    and post-SAM dilation to fragment large continuous wall planes into
+    disconnected islands. Edge safety is now handled once, lightly, by the
+    erosion inside apply_protection() in Stage 5.
+
+    Formula:
+        M_wall[x,y] = Σ G(dx,dy,σ) · M_refined[x+dx, y+dy]
+    where G is the 2D Gaussian kernel with std dev σ.
 
     Args:
-        mask:             (H, W) float32 array, values in [0, 1].
-                          Typically binary or near-binary from SAM.
-        gaussian_sigma:   Standard deviation of the Gaussian kernel.
-                          Controls the width of the soft feather zone.
-        kernel_size:      Gaussian kernel size (must be a positive odd integer).
-                          Larger = smoother transition but slower.
-        erosion_size:     Radius in pixels to shrink the mask.
-                          Removes edge contamination from adjacent objects.
-        noise_threshold:  Values below this are set to 0 after blurring.
-                          Removes faint halos that blur spreads outward.
+        mask:             (H, W) float32 from SAM, values in [0, 1].
+        gaussian_sigma:   Gaussian std dev — controls soft-edge width.
+        kernel_size:      Gaussian window size (positive odd integer).
+        noise_threshold:  Pixels below this are zeroed after blurring.
 
     Returns:
-        Processed mask: (H, W) float32, values in [0, 1].
-        Softer, cleaner, and safer for blending than the raw SAM output.
+        M_wall: (H, W) float32, values in [0, 1], smooth edges.
     """
-    # Work in float32 throughout — cv2 morphology/blur functions accept it.
     m = mask.astype(np.float32)
 
-    # --- Step 1: Erosion ---
-    # WHY: SAM traces the visual boundary of the wall, but that boundary is
-    # shared with the adjacent object (sofa, curtain, shelf). The pixels right
-    # ON the boundary technically belong to both regions. Eroding by a few
-    # pixels pulls the mask edge inward so those contested pixels are excluded
-    # from recoloring entirely — preventing the color from "bleeding" onto the
-    # edge of the neighboring object.
-    #
-    # We erode the float mask directly: treating the mask as a grayscale image,
-    # erosion replaces each pixel with the minimum value in the kernel window.
-    # On a binary mask that contracts the boundary; on a soft mask it darkens
-    # the edges, which is exactly what we want.
-    if erosion_size > 0:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,              # round kernel = isotropic erosion
-            (erosion_size * 2 + 1, erosion_size * 2 + 1),
-        )
-        m = cv2.erode(m, kernel, iterations=1)
-
-    # --- Step 2: Gaussian smoothing (feathering) ---
-    # WHY: after erosion the mask still has a hard binary edge. A hard edge
-    # in the mask means a hard visible seam in the recolored image — the wall
-    # color stops abruptly rather than fading naturally into the adjacent area.
-    # Gaussian blur replaces each pixel's value with a weighted average of its
-    # neighbours, turning the 0/1 step into a smooth 0→1 ramp over sigma pixels.
-    #
-    # Formula: M_soft[x,y] = Σ G(dx,dy,sigma) · M[x+dx, y+dy]
-    # where G is the 2D Gaussian kernel.
-    #
-    # The result: recolored pixels near the wall boundary receive a
-    # proportionally smaller colour shift, fading the painted area into the
-    # original so no seam is visible.
+    # --- Gaussian smoothing (feathering) ---
+    # Converts the hard 0/1 SAM boundary into a soft gradient so the
+    # blending formula O = M*R + (1-M)*I fades the new color in gradually
+    # rather than cutting sharply at the wall edge.
     k = _validated_kernel_size(kernel_size)
     m = cv2.GaussianBlur(m, (k, k), gaussian_sigma)
 
-    # --- Step 3: Noise threshold cleanup ---
-    # WHY: Gaussian blur spreads the mask outward slightly — pixels just
-    # outside the wall edge receive a small non-zero value from the blur.
-    # Most of these are genuinely unwanted (they land on furniture or the floor).
-    # Zeroing anything below noise_threshold removes this faint halo without
-    # touching the meaningful soft gradient at the real wall edge.
+    # --- Noise threshold ---
+    # Removes isolated low-value pixels (salt-and-pepper noise) that the
+    # Gaussian spreads slightly beyond the wall boundary. Threshold is
+    # intentionally low (0.04) to preserve the soft gradient zone — only
+    # truly negligible halos are zeroed out.
     if noise_threshold > 0:
         m[m < noise_threshold] = 0.0
 
-    # Clamp to [0,1] in case of any float rounding drift.
-    m = np.clip(m, 0.0, 1.0)
-
-    # WHY KEEP A SOFT MASK?
-    # The recoloring stage blends the new colour into the image weighted by
-    # this mask value. A binary mask (0 or 1) means full colour or no colour
-    # with a hard edge between them. A soft mask (0.0 → 1.0 gradient) means
-    # the colour fades in gradually at the boundary — exactly how real paint
-    # looks at the edge of a masked-off area. Keeping the mask soft here
-    # enables photorealistic transitions in Stage 4 at zero extra cost.
-
-    return m
+    return np.clip(m, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
