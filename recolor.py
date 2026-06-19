@@ -279,19 +279,24 @@ def run_pipeline(
         print("\n--- Stage 3: Skipped (use_sam=False) ---")
         refined_mask = coarse_mask
 
-    # Stage 3b: Mask processing — clean + soften before blending
-    print("\n--- Stage 3b: Mask processing ---")
-    from mask_process import process_mask
-    clean_mask = process_mask(refined_mask)
-    print(f"[stage3b] Clean mask range: [{clean_mask.min():.3f}, {clean_mask.max():.3f}]  "
-          f"mean={clean_mask.mean():.3f}")
-
-    # Stage 5: Lightweight erosion — pulls mask boundary inward by 3px to
-    # absorb edge aliasing without fragmenting large wall planes.
-    print("\n--- Stage 5: Object protection (lightweight erosion) ---")
-    from protect import create_object_protection_mask, apply_protection
-    final_mask = apply_protection(clean_mask)
-    print(f"[stage5] Final mask range: [{final_mask.min():.3f}, {final_mask.max():.3f}]  "
+    # Stage 3b + 5 combined: material-aware mask refinement.
+    # Replaces the old fragmented (Gaussian → erosion → protection) chain with
+    # one principled combination:
+    #   M_final = SAM_mask × W_texture × W_color × W_gradient → grid_norm → blur
+    print("\n--- Stage 3b+5: Material-aware mask refinement ---")
+    from mask_pipeline import material_aware_mask, compute_mask_metrics
+    final_mask, debug_maps = material_aware_mask(
+        preprocessed, refined_mask,
+        wall_color_rgb=None,   # auto-detected from mask centre
+    )
+    metrics = compute_mask_metrics(final_mask, preprocessed)
+    print(f"[mask]  Wall coverage: {metrics['wall_coverage_pct']}%  "
+          f"components: {metrics['n_components']}  "
+          f"edge_align: {metrics['edge_alignment']:.3f}  "
+          f"mat_var: {metrics['material_variance']:.1f}")
+    r, g, b = debug_maps['wall_color']
+    print(f"[mask]  Detected wall color: RGB({r},{g},{b})")
+    print(f"[mask]  Final mask range: [{final_mask.min():.3f}, {final_mask.max():.3f}]  "
           f"mean={final_mask.mean():.3f}")
 
     # Stage 4: Retinex-aware recoloring — preserves shading, handles dark LRV correctly.
