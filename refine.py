@@ -138,7 +138,7 @@ def load_sam_model(
             "  wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
         )
 
-    print(f"[refine] Loading SAM {model_type} from {checkpoint} → {device} ...")
+    print(f"[refine] Loading SAM {model_type} from {checkpoint} on {device} ...")
     sam = sam_model_registry[model_type](checkpoint=str(checkpoint))
     sam.to(device)
     sam.eval()
@@ -470,7 +470,7 @@ def visualize_refinement(
 
     if save_path is not None:
         plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
-        print(f"[refine] Visualisation saved → {save_path}")
+        print(f"[refine] Visualisation saved: {save_path}")
 
     plt.show()
 

@@ -91,7 +91,7 @@ def load_model(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"[segment] Loading DeepLabV3+ ResNet101 → {device} ...")
+    print(f"[segment] Loading DeepLabV3+ ResNet101 on {device} ...")
     print("[segment] (First run downloads ~250 MB of pretrained weights.)")
 
     # weights=DEFAULT fetches the best available COCO-pretrained checkpoint.
@@ -369,7 +369,7 @@ def visualize_mask(
 
     if save_path is not None:
         plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
-        print(f"[segment] Visualisation saved → {save_path}")
+        print(f"[segment] Visualisation saved: {save_path}")
 
     plt.show()
 
