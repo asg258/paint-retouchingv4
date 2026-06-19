@@ -14,6 +14,7 @@ Built with OpenCV, NumPy, PyTorch, and torchvision.
 | 3. SAM boundary refinement | ✅ Done | `refine.py` |
 | 3b. Mask processing (smooth + erode) | ✅ Done | `mask_process.py` |
 | 5. Object protection mask | ✅ Done | `protect.py` |
+| 6. Wall color detection (K-Means) | ✅ Done | `color_detect.py` |
 | 4. LAB wall recoloring | ✅ Done | `recolor.py` |
 | 5. Official color database | ✅ Done | `colors.py` + `colors_valspar.csv` |
 | 6. Post-processing + output | 🔜 Planned | — |
@@ -435,6 +436,89 @@ final_mask = apply_protection(clean_mask, protection_mask)
 python protect.py room.jpg
 # runs stages 1–5, saves <stem>_protection.png
 # 5-panel figure: wall mask | object mask | protection | final | overlay
+```
+
+---
+
+## Stage 6 — Wall Color Detection (`color_detect.py`)
+
+Extracts the **dominant wall color** from the masked region using K-Means
+clustering, independently of lighting, shadows, and compression noise.
+
+### Why not just average the wall pixels?
+
+A simple mean of all wall pixels gives a muddy result because lighting
+gradients (brighter near windows, darker in corners) and soft shadows each
+shift the average away from the true paint color. K-Means separates these
+into distinct clusters so you can pick just the dominant one.
+
+### How K-Means works here
+
+Only pixels where `M_final > 0.7` are used — the most confident wall pixels.
+
+```
+Wall pixels S = { I(x,y) | M_final(x,y) > 0.7 }
+
+K-Means objective:
+    minimize  Σ_{i=1}^{N} || x_i - μ_{c(i)} ||²
+
+Where:
+    x_i      = [R, G, B] color vector of pixel i
+    μ_{c(i)} = centroid of the cluster pixel i is assigned to
+    || · ||² = squared Euclidean distance in 3D RGB space
+    c(i)     = cluster assignment for pixel i
+
+Each term measures how far a pixel is from its cluster center.
+Minimizing the total drives each centroid to the mean color of its group.
+```
+
+Typical cluster layout in a room photo:
+
+| Cluster | What it captures | Why it's smaller |
+|---|---|---|
+| **Largest** | True base paint color | Most wall area is evenly lit |
+| Medium | Highlight zone (near window) | Only affects bright patches |
+| Small | Shadow / corner zone | Affects limited area |
+
+The dominant cluster (largest by pixel count) is the true base color.
+
+### What this feeds into
+
+- **Stage 7 (adaptive recoloring)** — measures the LAB distance between
+  the current wall color and the target color to scale the blend adaptively.
+  Dark-to-light and light-to-dark transitions need different treatment.
+- **Stage 9 (color consistency metric)** — compares the measured wall
+  color after recoloring against the target to verify accuracy.
+
+### Tunable parameters
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| `K_CLUSTERS` | `3` | Number of clusters. 3 = base + highlight + shadow |
+| `MASK_THRESHOLD` | `0.7` | Min mask confidence to include a pixel |
+| `KMEANS_ATTEMPTS` | `10` | Independent runs — best result kept |
+| `KMEANS_MAX_ITER` | `100` | Max iterations per run |
+
+### Public API
+
+```python
+from color_detect import extract_wall_color
+
+result = extract_wall_color(image_rgb, final_mask)
+
+result.dominant_color   # (3,) uint8 [R, G, B]
+result.dominant_lab     # (3,) float32 [L, A, B] — ready for Stage 7
+result.clusters         # (K, 3) uint8 — all centroids, largest first
+result.counts           # (K,) int — pixels per cluster
+result.fractions        # (K,) float — fraction of wall area
+```
+
+### Debug visualisation
+
+```bash
+python color_detect.py room.jpg
+# runs stages 1–6, saves <stem>_wall_colors.png
+# 3-panel figure: wall overlay | cluster swatches | dominant color swatch
 ```
 
 ---
